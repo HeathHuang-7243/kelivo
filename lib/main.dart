@@ -41,8 +41,10 @@ import 'core/providers/world_book_provider.dart';
 import 'core/providers/memory_provider.dart';
 import 'core/providers/memory_provider_v2.dart';
 import 'core/providers/backup_provider.dart';
+import 'core/providers/webdav_backup_schedule_provider.dart';
 import 'core/providers/local_snapshot_provider.dart';
 import 'features/backup/local_snapshot_scheduler.dart';
+import 'features/backup/webdav_backup_scheduler.dart';
 import 'core/services/memory/memory_pipeline.dart';
 import 'core/services/memory/memory_repository.dart';
 import 'core/providers/s3_backup_provider.dart';
@@ -74,6 +76,8 @@ import 'core/database/business_repository.dart';
 import 'core/database/business_startup_gate.dart';
 import 'core/database/chat_database_gateway.dart';
 import 'core/services/backup/backup_activity.dart';
+import 'core/services/backup/data_sync.dart';
+import 'core/services/backup/webdav_background_backup.dart';
 import 'core/services/backup/local_snapshot_schedule.dart';
 import 'core/services/chat/chat_service.dart';
 import 'features/home/services/context_usage_service.dart';
@@ -218,6 +222,9 @@ Future<void> main() async {
         runApp(_RestoreProgressApp(stage: restoreStage));
       }
       try {
+        await WebDavBackgroundBackup.yieldToForeground(
+          onWaiting: () => runApp(const _WebDavBackupStartupApp()),
+        );
         // The lease remains process-owned through its internal registry until
         // process exit, preventing another instance from racing business I/O.
         businessLease = await RestoreBusinessLease.acquire(
@@ -502,6 +509,42 @@ class _RestoreProgressApp extends StatelessWidget {
       theme: buildLightThemeForScheme(palette.light),
       darkTheme: buildDarkThemeForScheme(palette.dark),
       home: RestoreProgressScreen(stage: stage),
+    );
+  }
+}
+
+/// A background packer is stopping before this engine can open business data.
+class _WebDavBackupStartupApp extends StatelessWidget {
+  const _WebDavBackupStartupApp();
+
+  @override
+  Widget build(BuildContext context) {
+    final palette = ThemePalettes.defaultPalette;
+    return MaterialApp(
+      debugShowCheckedModeBanner: false,
+      title: 'Kelivo',
+      supportedLocales: AppLocalizations.supportedLocales,
+      localizationsDelegates: AppLocalizations.localizationsDelegates,
+      theme: buildLightThemeForScheme(palette.light),
+      darkTheme: buildDarkThemeForScheme(palette.dark),
+      home: Builder(
+        builder: (context) => Scaffold(
+          body: Center(
+            child: Column(
+              mainAxisSize: MainAxisSize.min,
+              children: [
+                const CircularProgressIndicator(),
+                const SizedBox(height: 20),
+                Text(
+                  AppLocalizations.of(
+                    context,
+                  )!.webDavScheduleFinishingBackgroundBackup,
+                ),
+              ],
+            ),
+          ),
+        ),
+      ),
     );
   }
 }
@@ -894,6 +937,25 @@ class MyApp extends StatelessWidget {
             },
           ),
         ),
+        ChangeNotifierProvider(
+          lazy: false,
+          create: (ctx) => WebDavBackupScheduleProvider(
+            preferences: businessPreferences,
+            backup: (cancelToken) =>
+                DataSync(
+                  chatService: ctx.read<ChatService>(),
+                  businessRepository: databaseLease.businessRepository,
+                  businessPreferences: businessPreferences,
+                ).backupToWebDav(
+                  ctx.read<SettingsProvider>().webDavConfig,
+                  cancelToken: cancelToken,
+                ),
+            isBusy: () =>
+                ChatActions.hasAnyActiveGeneration ||
+                BackupActivity.isActive ||
+                ctx.read<LocalSnapshotProvider>().working,
+          ),
+        ),
       ],
       child: Builder(
         builder: (context) {
@@ -1162,9 +1224,11 @@ class MyApp extends StatelessWidget {
                   }
 
                   final appWithOverlays = FloatingIpadPadding(
-                    child: LocalSnapshotScheduler(
-                      child: AppOverlays(
-                        child: child ?? const SizedBox.shrink(),
+                    child: WebDavBackupScheduler(
+                      child: LocalSnapshotScheduler(
+                        child: AppOverlays(
+                          child: child ?? const SizedBox.shrink(),
+                        ),
                       ),
                     ),
                   );

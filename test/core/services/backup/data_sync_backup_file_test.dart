@@ -1644,10 +1644,29 @@ void main() {
           isFalse,
         );
 
+        const oversizedManifestBytes = 16 * 1024 * 1024 + 1;
+        // Both records describe the manifest, which the writer adds last.
+        // ZIP decoders can take the size from the central directory rather
+        // than the streaming descriptor, so keep the forged metadata in sync.
         await _overwriteLastDataDescriptorUncompressedSize(
           backupFile,
-          16 * 1024 * 1024 + 1,
+          oversizedManifestBytes,
         );
+        await _overwriteCentralDirectoryUncompressedSize(
+          backupFile,
+          oversizedManifestBytes,
+        );
+        final input = InputFileStream(backupFile.path);
+        final archive = ZipDecoder().decodeStream(input);
+        try {
+          expect(
+            archive.findFile('manifest.json')?.size,
+            oversizedManifestBytes,
+          );
+        } finally {
+          archive.clearSync();
+          input.closeSync();
+        }
         final before = await BusinessRestoreService(
           businessRepository,
         ).exportSettings();

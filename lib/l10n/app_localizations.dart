@@ -4072,6 +4072,198 @@ abstract class AppLocalizations {
   /// **'Import from Chatbox'**
   String get backupPageImportFromChatbox;
 
+  /// No description provided for @webDavScheduleTitle.
+  ///
+  /// In en, this message translates to:
+  /// **'Scheduled WebDAV Backup'**
+  String get webDavScheduleTitle;
+
+  /// No description provided for @webDavScheduleEnabled.
+  ///
+  /// In en, this message translates to:
+  /// **'Automatic backup'**
+  String get webDavScheduleEnabled;
+
+  /// No description provided for @webDavScheduleInterval.
+  ///
+  /// In en, this message translates to:
+  /// **'Repeat interval'**
+  String get webDavScheduleInterval;
+
+  /// No description provided for @webDavScheduleWifiOnly.
+  ///
+  /// In en, this message translates to:
+  /// **'Wi-Fi / Ethernet only'**
+  String get webDavScheduleWifiOnly;
+
+  /// No description provided for @webDavScheduleWifiOnlyHint.
+  ///
+  /// In en, this message translates to:
+  /// **'Use Wi-Fi or Ethernet for uploads. Android background backups also wait for an unmetered connection.'**
+  String get webDavScheduleWifiOnlyHint;
+
+  /// No description provided for @webDavScheduleAndroidHint.
+  ///
+  /// In en, this message translates to:
+  /// **'Android runs backups in the background. Battery and network restrictions may delay them. Force-stopping the app pauses backups until it is opened again.'**
+  String get webDavScheduleAndroidHint;
+
+  /// No description provided for @webDavScheduleForegroundHint.
+  ///
+  /// In en, this message translates to:
+  /// **'Backups run while the app is open. Missed backups run when you return.'**
+  String get webDavScheduleForegroundHint;
+
+  /// No description provided for @webDavScheduleConfigureFirst.
+  ///
+  /// In en, this message translates to:
+  /// **'Configure and save your WebDAV server before enabling automatic backup.'**
+  String get webDavScheduleConfigureFirst;
+
+  /// No description provided for @webDavScheduleLastSuccess.
+  ///
+  /// In en, this message translates to:
+  /// **'Last successful backup'**
+  String get webDavScheduleLastSuccess;
+
+  /// No description provided for @webDavScheduleNextRun.
+  ///
+  /// In en, this message translates to:
+  /// **'Next backup (approx.)'**
+  String get webDavScheduleNextRun;
+
+  /// No description provided for @webDavScheduleStatus.
+  ///
+  /// In en, this message translates to:
+  /// **'Status'**
+  String get webDavScheduleStatus;
+
+  /// No description provided for @webDavScheduleRunNow.
+  ///
+  /// In en, this message translates to:
+  /// **'Run backup now'**
+  String get webDavScheduleRunNow;
+
+  /// No description provided for @webDavScheduleRunning.
+  ///
+  /// In en, this message translates to:
+  /// **'Backing up…'**
+  String get webDavScheduleRunning;
+
+  /// No description provided for @webDavScheduleFinishingBackgroundBackup.
+  ///
+  /// In en, this message translates to:
+  /// **'Finishing background backup…'**
+  String get webDavScheduleFinishingBackgroundBackup;
+
+  /// No description provided for @webDavScheduleReady.
+  ///
+  /// In en, this message translates to:
+  /// **'Waiting for next backup'**
+  String get webDavScheduleReady;
+
+  /// No description provided for @webDavScheduleFailed.
+  ///
+  /// In en, this message translates to:
+  /// **'Last backup failed'**
+  String get webDavScheduleFailed;
+
+  /// No description provided for @webDavScheduleDisabled.
+  ///
+  /// In en, this message translates to:
+  /// **'Disabled'**
+  String get webDavScheduleDisabled;
+
+  /// No description provided for @webDavScheduleNotConfigured.
+  ///
+  /// In en, this message translates to:
+  /// **'WebDAV server is not configured'**
+  String get webDavScheduleNotConfigured;
+
+  /// No description provided for @webDavScheduleEveryHours.
+  ///
+  /// In en, this message translates to:
+  /// **'{hours, plural, =1{Every hour} other{Every {hours} hours}}'**
+  String webDavScheduleEveryHours(int hours);
+
+  /// No description provided for @webDavScheduleEveryDay.
+  ///
+  /// In en, this message translates to:
+  /// **'Every day'**
+  String get webDavScheduleEveryDay;
+
+  /// No description provided for @webDavScheduleNever.
+  ///
+  /// In en, this message translates to:
+  /// **'Never'**
+  String get webDavScheduleNever;
+
+  /// No description provided for @webDavScheduleDue.
+  ///
+  /// In en, this message translates to:
+  /// **'When conditions allow'**
+  String get webDavScheduleDue;
+
+  /// No description provided for @webDavScheduleSaved.
+  ///
+  /// In en, this message translates to:
+  /// **'Backup schedule saved'**
+  String get webDavScheduleSaved;
+
+  /// No description provided for @webDavScheduleSaveFailed.
+  ///
+  /// In en, this message translates to:
+  /// **'Could not save the backup schedule'**
+  String get webDavScheduleSaveFailed;
+
+  /// No description provided for @webDavScheduleSucceeded.
+  ///
+  /// In en, this message translates to:
+  /// **'Backup uploaded'**
+  String get webDavScheduleSucceeded;
+
+  /// No description provided for @webDavScheduleUnavailable.
+  ///
+  /// In en, this message translates to:
+  /// **'Background scheduling is unavailable'**
+  String get webDavScheduleUnavailable;
+
+  /// No description provided for @webDavScheduleWifiRequired.
+  ///
+  /// In en, this message translates to:
+  /// **'Waiting for Wi-Fi or Ethernet'**
+  String get webDavScheduleWifiRequired;
+
+  /// No description provided for @webDavScheduleNetworkUnavailable.
+  ///
+  /// In en, this message translates to:
+  /// **'Waiting for a network connection'**
+  String get webDavScheduleNetworkUnavailable;
+
+  /// No description provided for @webDavScheduleBackupBusy.
+  ///
+  /// In en, this message translates to:
+  /// **'Another backup or restore is in progress'**
+  String get webDavScheduleBackupBusy;
+
+  /// No description provided for @webDavScheduleRetry.
+  ///
+  /// In en, this message translates to:
+  /// **'Waiting to retry'**
+  String get webDavScheduleRetry;
+
+  /// No description provided for @webDavScheduleTimedOut.
+  ///
+  /// In en, this message translates to:
+  /// **'Backup timed out'**
+  String get webDavScheduleTimedOut;
+
+  /// No description provided for @webDavScheduleCancelled.
+  ///
+  /// In en, this message translates to:
+  /// **'Backup cancelled'**
+  String get webDavScheduleCancelled;
+
   /// No description provided for @backupReminderSectionTitle.
   ///
   /// In en, this message translates to:

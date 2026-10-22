@@ -503,7 +503,7 @@ class DataSync {
   }
 
   // ===== WebDAV helpers =====
-  Uri _collectionUri(WebDavConfig cfg) {
+  static Uri _collectionUri(WebDavConfig cfg) {
     String base = cfg.url.trim();
     if (base.endsWith('/')) base = base.substring(0, base.length - 1);
     String pathPart = cfg.path.trim();
@@ -515,26 +515,26 @@ class DataSync {
     return Uri.parse(full);
   }
 
-  Uri _fileUri(WebDavConfig cfg, String childName) {
+  static Uri _fileUri(WebDavConfig cfg, String childName) {
     final base = _collectionUri(cfg).toString();
     final child = childName.replaceAll(RegExp(r'^/+'), '');
     return Uri.parse('$base$child');
   }
 
-  Map<String, String> _authHeaders(WebDavConfig cfg) {
+  static Map<String, String> _authHeaders(WebDavConfig cfg) {
     if (cfg.username.trim().isEmpty) return {};
     final token = base64Encode(utf8.encode('${cfg.username}:${cfg.password}'));
     return {'Authorization': 'Basic $token'};
   }
 
-  Map<String, String> _extraHeaders(WebDavConfig cfg) {
+  static Map<String, String> _extraHeaders(WebDavConfig cfg) {
     final h = <String, String>{};
     final ua = cfg.userAgent.trim();
     if (ua.isNotEmpty) h['User-Agent'] = ua;
     return h;
   }
 
-  Future<void> _ensureCollection(
+  static Future<void> _ensureCollection(
     WebDavConfig cfg, {
     BackupCancelToken? cancelToken,
   }) async {
@@ -645,6 +645,30 @@ class DataSync {
         exportBusinessSettingsFrom(businessRepository, scope: cfg.scope),
     snapshotDatabase: (destination) => chatService.createBackupDatabaseSnapshot(
       destination,
+      onProgress: onProgress,
+      cancelToken: cancelToken,
+    ),
+    onProgress: onProgress,
+    cancelToken: cancelToken,
+  )).file;
+
+  /// Prepares the ordinary selected-content backup without chat-provider
+  /// initialization. The caller must hold the restore business lease.
+  static Future<File> prepareScheduledBackupArchive({
+    required File databaseFile,
+    required BusinessRepository businessRepository,
+    required WebDavConfig config,
+    BackupProgressSink? onProgress,
+    BackupCancelToken? cancelToken,
+  }) async => (await _prepareBackupArchive(
+    includeChats: config.scope.includes(BackupCategory.chats),
+    includeFiles: config.scope.assetRoots.isNotEmpty,
+    scope: config.scope,
+    exportSettings: () =>
+        exportBusinessSettingsFrom(businessRepository, scope: config.scope),
+    snapshotDatabase: (destination) => ChatService.createBackupSnapshot(
+      sourceFile: databaseFile,
+      destinationFile: destination,
       onProgress: onProgress,
       cancelToken: cancelToken,
     ),
@@ -1648,6 +1672,23 @@ class DataSync {
       onProgress: onProgress,
       cancelToken: cancelToken,
     );
+    await uploadWebDavBackupFile(
+      cfg,
+      file,
+      onProgress: onProgress,
+      cancelToken: cancelToken,
+    );
+  }
+
+  /// Uploads an already packed archive so a headless engine can close its live
+  /// database and release the restore lease before waiting on the network.
+  /// The temporary archive is consumed and cleaned up on every outcome.
+  static Future<void> uploadWebDavBackupFile(
+    WebDavConfig cfg,
+    File file, {
+    BackupProgressSink? onProgress,
+    BackupCancelToken? cancelToken,
+  }) async {
     try {
       await _ensureCollection(cfg, cancelToken: cancelToken);
       if (cancelToken?.isCancelled == true) {
@@ -1657,6 +1698,7 @@ class DataSync {
       final fileLen = await file.length();
       // Use a streamed request so we don't load the entire file into RAM.
       final req = http.StreamedRequest('PUT', target);
+      req.contentLength = fileLen;
       req.headers.addAll({
         'content-type': 'application/zip',
         'content-length': fileLen.toString(),
@@ -2146,12 +2188,15 @@ class DataSync {
     }
   }
 
-  Future<void> _deleteRemoteQuietly(WebDavConfig cfg, Uri target) async {
+  static Future<void> _deleteRemoteQuietly(WebDavConfig cfg, Uri target) async {
     final client = http.Client();
     try {
       final req = http.Request('DELETE', target);
       req.headers.addAll({..._authHeaders(cfg), ..._extraHeaders(cfg)});
-      await client.send(req).then(http.Response.fromStream);
+      await client
+          .send(req)
+          .then(http.Response.fromStream)
+          .timeout(const Duration(seconds: 10));
     } catch (_) {
     } finally {
       client.close();
