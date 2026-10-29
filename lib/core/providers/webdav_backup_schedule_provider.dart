@@ -205,6 +205,10 @@ class WebDavBackupScheduleProvider extends ChangeNotifier {
         await _recordSkipped('webdav_not_configured');
         return false;
       }
+      if (_preferences.getBool('backup_encryption_enabled_v1') == true) {
+        await _recordSkipped('backup_password_required');
+        return false;
+      }
       if (!await _networkAvailable(_settings.wifiOnly)) {
         await _recordSkipped(
           _settings.wifiOnly ? 'wifi_required' : 'network_unavailable',

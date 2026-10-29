@@ -7,6 +7,7 @@ import 'dart:io';
 import 'package:Kelivo/core/models/chat_input_data.dart';
 import 'package:Kelivo/core/providers/assistant_provider.dart';
 import 'package:Kelivo/core/providers/settings_provider.dart';
+import 'package:Kelivo/core/services/storage/windows_data_directory.dart';
 import 'package:Kelivo/desktop/windows_paste_fix.dart';
 import 'package:Kelivo/features/home/widgets/chat_input_bar.dart';
 import 'package:Kelivo/icons/lucide_adapter.dart';
@@ -199,6 +200,11 @@ void main() {
   }
 
   testWidgets('Windows 历史粘贴复用文本、长文本附件和图片入口', (tester) async {
+    await tester.runAsync(() async {
+      final storage = await WindowsDataDirectory.instance;
+      await storage.initialize();
+      addTearDown(storage.close);
+    });
     final nativeClipboardContext = MockMessageChannelContext()
       ..registerMockMethodCallHandler('ClipboardReader', (_) {
         throw PlatformException(code: 'unavailable-in-widget-test');
@@ -447,9 +453,19 @@ void main() {
       fakePathProvider.completedAppDataRequests,
       greaterThan(completedRequestsBeforeDispose),
     );
-    final remainingPaths = await tester.runAsync(
-      () => uploadDir.list().map((entry) => entry.path).toSet(),
-    );
+    // Pump the continuation that removes a file written after disposal; a
+    // fixed real-clock delay does not drain the widget test's fake-clock work.
+    Set<String>? remainingPaths;
+    for (var attempt = 0; attempt < 400; attempt++) {
+      await tester.pump();
+      remainingPaths = await tester.runAsync(
+        () => uploadDir.list().map((entry) => entry.path).toSet(),
+      );
+      if (setEquals(remainingPaths, existingPaths)) break;
+      await tester.runAsync(
+        () => Future<void>.delayed(const Duration(milliseconds: 10)),
+      );
+    }
     expect(remainingPaths, existingPaths);
 
     controller.dispose();

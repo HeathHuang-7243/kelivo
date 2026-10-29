@@ -97,6 +97,28 @@ void main() {
     },
   );
 
+  test('encrypted prepared archive keeps its binary content type', () async {
+    archive = await archive.rename('${temporary.path}/backup.kbackup');
+    var uploaded = false;
+    await http.runWithClient(
+      () => DataSync.uploadWebDavBackupFile(config, archive),
+      () => MockClient.streaming((request, body) async {
+        if (request.method == 'PUT') {
+          uploaded = true;
+          expect(request.headers['content-type'], 'application/octet-stream');
+          expect(request.url.path, endsWith('/backup.kbackup'));
+          expect(await body.toBytes(), payload);
+        } else {
+          expect(request.method, 'PROPFIND');
+          await body.drain<void>();
+        }
+        return http.StreamedResponse(const Stream.empty(), 200);
+      }),
+    );
+    expect(uploaded, isTrue);
+    expect(await archive.exists(), isFalse);
+  });
+
   test('cancelled preparation never starts a remote request', () async {
     final token = BackupCancelToken()..cancel();
     addTearDown(token.dispose);

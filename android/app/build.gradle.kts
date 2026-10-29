@@ -74,6 +74,11 @@ android {
             applicationIdSuffix = ".webdavtest"
             manifestPlaceholders["appLabel"] = "Kelivo WebDAV Test"
         }
+        getByName("profile") {
+            applicationIdSuffix = ".webdavtest"
+            manifestPlaceholders["appLabel"] = "Kelivo WebDAV Test"
+            signingConfig = signingConfigs.getByName("debug")
+        }
         getByName("release") {
             if (keystorePropertiesFile.exists()) {
                 signingConfig = signingConfigs.getByName("release")

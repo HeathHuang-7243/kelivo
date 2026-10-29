@@ -85,6 +85,7 @@ class _WebDavBackupScheduleSectionState
               'webdav_not_configured',
               'backup_busy',
               'backup_timeout',
+              'backup_password_required',
             }.contains(rawError)
         ? null
         : WebDavBackupSchedule.safeError(rawError);
@@ -262,6 +263,7 @@ String webDavScheduleErrorLabel(AppLocalizations l10n, String? error) =>
       'webdav_not_configured' => l10n.webDavScheduleNotConfigured,
       'backup_busy' => l10n.webDavScheduleBackupBusy,
       'backup_timeout' => l10n.webDavScheduleTimedOut,
+      'backup_password_required' => l10n.webDavSchedulePasswordRequired,
       _ => l10n.webDavScheduleFailed,
     };
 

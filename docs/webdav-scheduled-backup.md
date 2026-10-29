@@ -16,6 +16,14 @@ Each upload uses the existing ZIP backup format and the saved backup categories.
 The schedule is device-local: importing a backup does not enable unattended
 uploads on another device.
 
+Encrypted backups require interactive password confirmation. When backup
+encryption is enabled, scheduled runs and **Run now** in the scheduled-backup
+section stop with a password-confirmation message. Use the regular manual
+WebDAV backup action to enter the encryption password, or explicitly turn off
+backup encryption before using scheduled backups. The password stays in the
+interactive backup session; the scheduler does not store it or fall back to an
+unencrypted upload.
+
 ## Android background execution
 
 Android uses WorkManager, alongside checks in the running app. WorkManager can
@@ -35,7 +43,7 @@ settings screen describes the applicable background behavior.
 
 ## Test APK
 
-Debug builds use application ID `com.psyche.kelivo.webdavtest` and display name
+Debug and profile builds use application ID `com.psyche.kelivo.webdavtest` and display name
 **Kelivo WebDAV Test**. They install alongside the production application and
 have their own data. Export a backup from the production app and import it into
 the test app if representative test data is needed.
@@ -54,5 +62,5 @@ Build an ARM64 test package with the project's Flutter SDK:
 ```sh
 flutter pub get
 flutter gen-l10n
-flutter build apk --debug --target-platform android-arm64
+flutter build apk --profile --split-per-abi --target-platform android-arm64
 ```

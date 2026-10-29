@@ -160,6 +160,10 @@ final class WebDavBackupSchedule {
 
   /// Keep provider credentials and remote URLs out of persistent error text.
   static String safeError(Object error) {
+    if (error is FormatException &&
+        error.message == 'backup_password_required') {
+      return 'backup_password_required';
+    }
     var message = error.toString().replaceAll(
       RegExp(r'https?://[^\s\x27\x22<>]+', caseSensitive: false),
       '[server]',

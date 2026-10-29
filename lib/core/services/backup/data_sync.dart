@@ -1,3 +1,4 @@
+import 'package:Kelivo/core/models/tool_permission_mode.dart';
 import 'package:sqlite3/sqlite3.dart' as composer_sqlite;
 import 'dart:async';
 import 'dart:convert';
@@ -35,10 +36,12 @@ import '../../../utils/sandbox_path_resolver.dart';
 import '../../database/backup_portability.dart';
 import 'backup_settings_validator.dart';
 import 'restore_bundle_preparation.dart';
+import 'restore_durability.dart';
 import 'restore_workspace_lock.dart';
 import 'restore_business_lease.dart';
 import 'temporary_restore_file.dart';
 import 'backup_cancel_token.dart';
+import 'backup_encryption.dart';
 import 'backup_isolate_runner.dart';
 import 'backup_task_progress.dart';
 import 'streaming_zip_entry.dart';
@@ -308,6 +311,7 @@ class DataSync {
   final ChatService chatService;
   final BusinessRepository businessRepository;
   final BusinessPreferences? businessPreferences;
+  final RestoreDurability? _restoreDurability;
   BackupMergeReport? _lastMergeReport;
   BackupMergeReport? get lastMergeReport => _lastMergeReport;
 
@@ -315,16 +319,25 @@ class DataSync {
     required this.chatService,
     required this.businessRepository,
     this.businessPreferences,
-  });
+    @visibleForTesting RestoreDurability? restoreDurability,
+    // Public injection name deliberately omits the private-field prefix.
+    // ignore: prefer_initializing_formals
+  }) : _restoreDurability = restoreDurability;
 
-  Future<T> _runLiveBusinessRestore<T>(Future<T> Function() operation) {
+  Future<T> _runLiveBusinessRestore<T>(
+    Future<T> Function() operation, {
+    bool Function()? canResumeOnError,
+  }) {
     final preferences = businessPreferences;
     return preferences == null
         ? operation()
-        : preferences.runWithRestoreWriteFence(operation);
+        : preferences.runWithRestoreWriteFence(
+            operation,
+            canResumeOnError: canResumeOnError,
+          );
   }
 
-  static Future<void> _prepareRestoreBundle({
+  Future<void> _prepareLiveRestoreBundle({
     required String appDataPath,
     required String extractedPath,
     required String sourceManifestSha256,
@@ -336,19 +349,37 @@ class DataSync {
     Map<String, dynamic>? validatedSettings,
     BackupProgressSink? onProgress,
     BackupCancelToken? cancelToken,
-  }) => RestoreBundlePreparation.prepare(
-    appDataDirectory: Directory(appDataPath),
-    extractedDirectory: Directory(extractedPath),
-    sourceManifestSha256: sourceManifestSha256,
-    bundleIncludesChats: includeChats,
-    bundleIncludesFiles: includeFiles,
-    restoreChats: restoreChats,
-    restoreFiles: restoreFiles,
-    scope: scope,
-    validatedSettings: validatedSettings,
-    onProgress: onProgress,
-    cancelToken: cancelToken,
-  );
+  }) {
+    var canResume = true;
+    void Function()? resumeUi;
+    return _runLiveBusinessRestore<void>(() async {
+      await RestoreBundlePreparation.prepare(
+        appDataDirectory: Directory(appDataPath),
+        extractedDirectory: Directory(extractedPath),
+        sourceManifestSha256: sourceManifestSha256,
+        bundleIncludesChats: includeChats,
+        bundleIncludesFiles: includeFiles,
+        restoreChats: restoreChats,
+        restoreFiles: restoreFiles,
+        scope: scope,
+        validatedSettings: validatedSettings,
+        onProgress: onProgress,
+        cancelToken: cancelToken,
+        durability: _restoreDurability,
+        beforePublish: () async {
+          final uiStore = chatService.chatRepositoryOrNull?.genUiStates;
+          await uiStore?.pauseAndDrain();
+          resumeUi = uiStore?.resume;
+          // This conclusion also controls settings, even with no mounted UI store.
+          canResume = false;
+        },
+        onUnpublishedDiscarded: () {
+          canResume = true;
+          resumeUi?.call();
+        },
+      );
+    }, canResumeOnError: () => canResume);
+  }
 
   /// Prepares a local snapshot without opening the live database or providers.
   /// The normal startup gate installs the durable candidate on restart, keeping
@@ -634,23 +665,59 @@ class DataSync {
 
   Future<File> prepareBackupFile(
     WebDavConfig cfg, {
+    String? password,
     BackupProgressSink? onProgress,
     BackupCancelToken? cancelToken,
-  }) async => (await _prepareBackupArchive(
-    chatService: chatService,
-    includeChats: cfg.scope.includes(BackupCategory.chats),
-    includeFiles: cfg.scope.assetRoots.isNotEmpty,
-    scope: cfg.scope,
-    exportSettings: () =>
-        exportBusinessSettingsFrom(businessRepository, scope: cfg.scope),
-    snapshotDatabase: (destination) => chatService.createBackupDatabaseSnapshot(
-      destination,
+  }) async {
+    if (password != null && password.isEmpty) {
+      throw ArgumentError('backup_password_empty');
+    }
+    // All interactive backup providers inject the shared business preferences.
+    // Enforce the saved choice here too, so a missing UI password cannot turn
+    // an encrypted backup into a plaintext export or upload.
+    await businessPreferences?.load();
+    if (password == null &&
+        businessPreferences?.getBool('backup_encryption_enabled_v1') == true) {
+      throw const FormatException('backup_password_required');
+    }
+    final archive = await _prepareBackupArchive(
+      chatService: chatService,
+      includeChats: cfg.scope.includes(BackupCategory.chats),
+      includeFiles: cfg.scope.assetRoots.isNotEmpty,
+      scope: cfg.scope,
+      exportSettings: () =>
+          exportBusinessSettingsFrom(businessRepository, scope: cfg.scope),
+      snapshotDatabase: (destination) =>
+          chatService.createBackupDatabaseSnapshot(
+            destination,
+            onProgress: onProgress,
+            cancelToken: cancelToken,
+          ),
       onProgress: onProgress,
       cancelToken: cancelToken,
-    ),
-    onProgress: onProgress,
-    cancelToken: cancelToken,
-  )).file;
+    );
+    if (password == null) return archive.file;
+    final encrypted = File(
+      p.setExtension(archive.file.path, '.${BackupEncryption.extension}'),
+    );
+    try {
+      await BackupEncryption.encryptFile(
+        source: archive.file,
+        destination: encrypted,
+        password: password,
+        onProgress: onProgress,
+        cancelToken: cancelToken,
+      );
+      await archive.file.delete();
+      return takePreparedBackupFile(encrypted, cancelToken);
+    } catch (error) {
+      await deleteTempDirectoryWhenIsolateSafe(
+        archive.file.parent,
+        error: error,
+      );
+      rethrow;
+    }
+  }
 
   /// Prepares the ordinary selected-content backup without chat-provider
   /// initialization. The caller must hold the restore business lease.
@@ -660,21 +727,32 @@ class DataSync {
     required WebDavConfig config,
     BackupProgressSink? onProgress,
     BackupCancelToken? cancelToken,
-  }) async => (await _prepareBackupArchive(
-    includeChats: config.scope.includes(BackupCategory.chats),
-    includeFiles: config.scope.assetRoots.isNotEmpty,
-    scope: config.scope,
-    exportSettings: () =>
-        exportBusinessSettingsFrom(businessRepository, scope: config.scope),
-    snapshotDatabase: (destination) => ChatService.createBackupSnapshot(
-      sourceFile: databaseFile,
-      destinationFile: destination,
+  }) async {
+    // Encryption passwords are deliberately session-only and require an
+    // interactive confirmation. A headless job must honor the saved choice
+    // before creating any plaintext archive or opening a snapshot worker.
+    if (await businessRepository.getPreference(
+          'backup_encryption_enabled_v1',
+        ) ==
+        true) {
+      throw const FormatException('backup_password_required');
+    }
+    return (await _prepareBackupArchive(
+      includeChats: config.scope.includes(BackupCategory.chats),
+      includeFiles: config.scope.assetRoots.isNotEmpty,
+      scope: config.scope,
+      exportSettings: () =>
+          exportBusinessSettingsFrom(businessRepository, scope: config.scope),
+      snapshotDatabase: (destination) => ChatService.createBackupSnapshot(
+        sourceFile: databaseFile,
+        destinationFile: destination,
+        onProgress: onProgress,
+        cancelToken: cancelToken,
+      ),
       onProgress: onProgress,
       cancelToken: cancelToken,
-    ),
-    onProgress: onProgress,
-    cancelToken: cancelToken,
-  )).file;
+    )).file;
+  }
 
   /// Packs the live database for the local copy store.
   ///
@@ -1104,7 +1182,9 @@ class DataSync {
       await for (final ent in tmp.list(followLinks: false)) {
         if (_isLiveTempPath(ent.path)) continue;
         final name = p.basename(ent.path);
-        if (ent is Directory && name.startsWith('kelivo_backup_')) {
+        if (ent is Directory &&
+            (name.startsWith('kelivo_backup_') ||
+                name.startsWith('kelivo_decrypted_'))) {
           if (await isStale(ent, name)) await _deleteDirectoryQuietly(ent);
         } else if (ent is File &&
             ((name.startsWith('kelivo_backup_') && name.endsWith('.zip')) ||
@@ -1263,6 +1343,9 @@ class DataSync {
       entries[_manifestEntryName] = writer.addFile(
         manifestFile,
         _manifestEntryName,
+        // Packing progress counts the source files measured before writing.
+        // Generated metadata must not exceed that total.
+        reportProgress: false,
       );
       writer.closeSync();
       return entries;
@@ -1664,11 +1747,13 @@ class DataSync {
 
   Future<void> backupToWebDav(
     WebDavConfig cfg, {
+    String? password,
     BackupProgressSink? onProgress,
     BackupCancelToken? cancelToken,
   }) async {
     final file = await prepareBackupFile(
       cfg,
+      password: password,
       onProgress: onProgress,
       cancelToken: cancelToken,
     );
@@ -1700,7 +1785,11 @@ class DataSync {
       final req = http.StreamedRequest('PUT', target);
       req.contentLength = fileLen;
       req.headers.addAll({
-        'content-type': 'application/zip',
+        'content-type':
+            p.extension(file.path).toLowerCase() ==
+                '.${BackupEncryption.extension}'
+            ? 'application/octet-stream'
+            : 'application/zip',
         'content-length': fileLen.toString(),
         ..._authHeaders(cfg),
         ..._extraHeaders(cfg),
@@ -1852,7 +1941,7 @@ class DataSync {
       // If mtime is null, try to extract from filename (format: kelivo_backup_2025-01-19T12-34-56.123456.zip)
       if (mtime == null) {
         final match = RegExp(
-          r'kelivo_backup_(\d{4}-\d{2}-\d{2}T\d{2}-\d{2}-\d{2}\.\d+)\.zip',
+          r'kelivo_backup_(\d{4}-\d{2}-\d{2}T\d{2}-\d{2}-\d{2}\.\d+)\.(?:zip|kbackup)',
         ).firstMatch(name);
         if (match != null) {
           try {
@@ -1990,7 +2079,9 @@ class DataSync {
     required ForwardCompatibilityPrompt? prompt,
     required bool allowUnverifiedForwardCompatible,
   }) async {
-    if (prompt == null) return allowUnverifiedForwardCompatible;
+    if (prompt == null || allowUnverifiedForwardCompatible) {
+      return allowUnverifiedForwardCompatible;
+    }
     final compatibility = await inspectBackupCompatibility(file);
     // No manifest or no SQLite payload: nothing to ask about, and the restore
     // itself will report any real problem.
@@ -2013,6 +2104,7 @@ class DataSync {
     BackupCancelToken? cancelToken,
     bool allowUnverifiedForwardCompatible = false,
     ForwardCompatibilityPrompt? onForwardCompatibility,
+    BackupPasswordPrompt? onPassword,
   }) async {
     // Stream the download to a file instead of buffering in memory.
     final client = http.Client();
@@ -2054,20 +2146,16 @@ class DataSync {
         }
         rethrow;
       }
-      // Only now does the archive exist locally, so this is the earliest the
-      // question can be put to the user.
-      final allowUnverified = await _askForwardCompatibility(
-        file,
-        prompt: onForwardCompatibility,
-        allowUnverifiedForwardCompatible: allowUnverifiedForwardCompatible,
-      );
-      await _restoreFromBackupFile(
+      await restoreFromLocalFile(
         file,
         cfg,
         mode: mode,
         onProgress: onProgress,
         cancelToken: cancelToken,
-        allowUnverifiedForwardCompatible: allowUnverified,
+        allowUnverifiedForwardCompatible: allowUnverifiedForwardCompatible,
+        onForwardCompatibility: onForwardCompatibility,
+        onPassword: onPassword,
+        requireEncrypted: item.href.path.toLowerCase().endsWith('.kbackup'),
       );
     } catch (error) {
       if (error is BackupCancelledException ||
@@ -2096,10 +2184,15 @@ class DataSync {
 
   Future<File> exportToFile(
     WebDavConfig cfg, {
+    String? password,
     BackupProgressSink? onProgress,
     BackupCancelToken? cancelToken,
-  }) =>
-      prepareBackupFile(cfg, onProgress: onProgress, cancelToken: cancelToken);
+  }) => prepareBackupFile(
+    cfg,
+    password: password,
+    onProgress: onProgress,
+    cancelToken: cancelToken,
+  );
 
   @visibleForTesting
   static void verifyPackedBackupSync({
@@ -2131,23 +2224,81 @@ class DataSync {
     BackupCancelToken? cancelToken,
     bool allowUnverifiedForwardCompatible = false,
     ForwardCompatibilityPrompt? onForwardCompatibility,
+    BackupPasswordPrompt? onPassword,
+    bool requireEncrypted = false,
   }) async {
     if (!await file.exists()) throw Exception('备份文件不存在');
-    // Usually already answered by the caller, which had the file all along;
-    // the prompt is here for S3, which downloads through this entry point.
-    final allowUnverified = await _askForwardCompatibility(
-      file,
-      prompt: onForwardCompatibility,
-      allowUnverifiedForwardCompatible: allowUnverifiedForwardCompatible,
-    );
-    await _restoreFromBackupFile(
-      file,
-      cfg,
-      mode: mode,
-      onProgress: onProgress,
-      cancelToken: cancelToken,
-      allowUnverifiedForwardCompatible: allowUnverified,
-    );
+    Directory? decryptedDirectory;
+    Object? failure;
+    try {
+      var readable = file;
+      final encrypted = await BackupEncryption.isEncrypted(file);
+      if (!encrypted &&
+          (requireEncrypted ||
+              p.extension(file.path).toLowerCase() == '.kbackup')) {
+        throw const FormatException('backup_encryption_header');
+      }
+      if (encrypted) {
+        if (onPassword == null) {
+          throw const FormatException('backup_password_required');
+        }
+        final tmp = await _ensureTempDir();
+        await _cleanupPreviousBackupTempFiles(tmp);
+        decryptedDirectory = await tmp.createTemp('kelivo_decrypted_');
+        registerLiveTempPath(decryptedDirectory.path);
+        readable = File(p.join(decryptedDirectory.path, 'backup.zip'));
+        var retry = false;
+        while (true) {
+          if (cancelToken?.isCancelled == true) {
+            throw const BackupCancelledException();
+          }
+          final password = await onPassword(retry: retry);
+          if (password == null || cancelToken?.isCancelled == true) {
+            throw const BackupCancelledException();
+          }
+          if (password.isEmpty) {
+            retry = true;
+            continue;
+          }
+          try {
+            await BackupEncryption.decryptFile(
+              source: file,
+              destination: readable,
+              password: password,
+              onProgress: onProgress,
+              cancelToken: cancelToken,
+            );
+            break;
+          } on BackupDecryptionException {
+            retry = true;
+          }
+        }
+      }
+      // Both compatibility checks and restore see only authenticated plaintext.
+      final allowUnverified = await _askForwardCompatibility(
+        readable,
+        prompt: onForwardCompatibility,
+        allowUnverifiedForwardCompatible: allowUnverifiedForwardCompatible,
+      );
+      await _restoreFromBackupFile(
+        readable,
+        cfg,
+        mode: mode,
+        onProgress: onProgress,
+        cancelToken: cancelToken,
+        allowUnverifiedForwardCompatible: allowUnverified,
+      );
+    } catch (error) {
+      failure = error;
+      rethrow;
+    } finally {
+      if (decryptedDirectory != null) {
+        await deleteTempDirectoryWhenIsolateSafe(
+          decryptedDirectory,
+          error: failure,
+        );
+      }
+    }
   }
 
   // ===== Internal helpers =====
@@ -2737,7 +2888,7 @@ class DataSync {
         (entry as Map).cast<String, dynamic>(),
       );
       return conversation.copyWith(
-        extras: {...conversation.extras}..remove('workspace.allowAll'),
+        extras: ToolPermissionMode.withoutGrant(conversation.extras),
       );
     }).toList();
 
@@ -3194,7 +3345,9 @@ class DataSync {
     File file,
   ) async {
     try {
-      if (!await file.exists()) return null;
+      if (!await file.exists() || await BackupEncryption.isEncrypted(file)) {
+        return null;
+      }
       final inputStream = InputFileStream(file.path);
       Map<String, dynamic>? manifest;
       try {
@@ -3381,20 +3534,18 @@ class DataSync {
           }
           // Drain accepted business writes before preserving unselected data,
           // then keep writers fenced until the required restart.
-          await _runLiveBusinessRestore(
-            () => _prepareRestoreBundle(
-              appDataPath: appDataPath,
-              extractedPath: extractedPath,
-              sourceManifestSha256: sourceManifestSha256,
-              includeChats: includeChats,
-              includeFiles: includeFiles,
-              restoreChats: restoreChats,
-              restoreFiles: restoreFiles,
-              validatedSettings: settings,
-              scope: scope,
-              onProgress: onProgress,
-              cancelToken: cancelToken,
-            ),
+          await _prepareLiveRestoreBundle(
+            appDataPath: appDataPath,
+            extractedPath: extractedPath,
+            sourceManifestSha256: sourceManifestSha256,
+            includeChats: includeChats,
+            includeFiles: includeFiles,
+            restoreChats: restoreChats,
+            restoreFiles: restoreFiles,
+            validatedSettings: settings,
+            scope: scope,
+            onProgress: onProgress,
+            cancelToken: cancelToken,
           );
           return;
         }
@@ -3848,7 +3999,11 @@ class _StreamingZipWriter {
   final List<_StreamingZipEntry> _entries = <_StreamingZipEntry>[];
   bool _closed = false;
 
-  _BackupEntryMetadata addFile(File file, String entryName) {
+  _BackupEntryMetadata addFile(
+    File file,
+    String entryName, {
+    bool reportProgress = true,
+  }) {
     if (_closed) {
       throw StateError('Cannot add files after the ZIP writer is closed.');
     }
@@ -3878,7 +4033,11 @@ class _StreamingZipWriter {
       usesZip64: usesZip64Entry,
     );
 
-    final written = _writeDeflatedFile(file, entryName);
+    final written = _writeDeflatedFile(
+      file,
+      entryName,
+      reportProgress: reportProgress,
+    );
     _writeDataDescriptor(written, usesZip64: usesZip64Entry);
 
     _entries.add(
@@ -3945,7 +4104,11 @@ class _StreamingZipWriter {
     }
   }
 
-  _StreamingZipWrittenFile _writeDeflatedFile(File file, String entryName) {
+  _StreamingZipWrittenFile _writeDeflatedFile(
+    File file,
+    String entryName, {
+    required bool reportProgress,
+  }) {
     final compressedSink = _CountingOutputSink(_output);
     final inputSink = ZLibCodec(
       level: ZLibOption.defaultLevel,
@@ -3967,7 +4130,11 @@ class _StreamingZipWriter {
         uncompressedSize += read;
         hashSink.add(chunk);
         inputSink.add(chunk);
-        meter?.add(read, detail: entryName);
+        if (reportProgress) {
+          meter?.add(read, detail: entryName);
+        } else {
+          meter?.ctx?.throwIfCancelled();
+        }
       }
       hashSink.close();
       inputSink.close();

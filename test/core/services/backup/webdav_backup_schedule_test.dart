@@ -101,4 +101,13 @@ void main() {
     expect(error, isNot(contains('example.com')));
     expect(error, isNot(contains('YWxpY2U6c2VjcmV0')));
   });
+
+  test('required encryption confirmation has a stable user-facing code', () {
+    expect(
+      WebDavBackupSchedule.safeError(
+        const FormatException('backup_password_required'),
+      ),
+      'backup_password_required',
+    );
+  });
 }

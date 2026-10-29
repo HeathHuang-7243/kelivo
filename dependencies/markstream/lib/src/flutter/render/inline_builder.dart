@@ -123,15 +123,28 @@ class InlineSpanBuilder {
       );
     }
 
-    WidgetSpan codeAtom(String value, {bool keyboard = false}) {
+    WidgetSpan codeAtom(
+      String value, {
+      bool keyboard = false,
+      List<TextSegment>? segments,
+    }) {
       Widget capsule = InlineCodeCapsule(
         text: value,
+        textSpan: segments == null
+            ? null
+            : extensions.literalSpanBuilder?.call(
+                context,
+                TextSpan(text: value, style: theme.inlineCode.text),
+                segments,
+              ),
         mouseCursor: onTap == null
             ? SystemMouseCursors.text
             : SystemMouseCursors.click,
         style: theme.inlineCode.text,
         backgroundColor: keyboard
-            ? theme.colors.fillBlock
+            ? (theme.backdrop == MarkstreamBackdrop.plain
+                  ? theme.colors.fillBlock
+                  : theme.colors.fillRaised)
             : theme.inlineCode.backgroundColor,
         borderColor: theme.inlineCode.borderColor,
         padding: theme.inlineCode.padding,
@@ -208,11 +221,19 @@ class InlineSpanBuilder {
           ]),
         ),
       );
+    if (node is HighlightNode)
+      return children(node.children, highlightedTextStyle(style, theme));
     if (node is LinkNode)
       return children(node.children, style.merge(theme.link), target: node);
     if (node is CodeSpanNode) {
       for (final fragment in node.children) emit(fragment.text, fragment);
-      return codeAtom(node.code);
+      return codeAtom(
+        node.code,
+        segments: [
+          for (final part in node.children)
+            TextSegment(text: part.text, sourceSpan: part.span, node: part),
+        ],
+      );
     }
     if (node is MathInlineNode) {
       emit(toPlainText(node), node);

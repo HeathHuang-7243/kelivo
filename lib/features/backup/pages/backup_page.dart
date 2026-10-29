@@ -35,6 +35,7 @@ import '../forward_compat_consent_dialog.dart';
 import '../backup_restart_dialog.dart';
 import '../widgets/backup_reminder_helpers.dart';
 import '../widgets/backup_scope_tile.dart';
+import '../widgets/backup_encryption_tile.dart';
 import '../widgets/storage_migration_notice_button.dart';
 import '../widgets/webdav_backup_schedule_section.dart';
 import 'package:Kelivo/theme/app_semantic_colors.dart';
@@ -314,19 +315,30 @@ class _BackupPageState extends State<BackupPage> {
                 // Section 1: 备份管理
                 header(l10n.backupPageBackupManagement, first: true),
                 SectionCard(
-                  child: BackupScopeTile(
-                    scope: cfg.scope,
-                    onChanged: vm.busy || s3Vm.busy
-                        ? null
-                        : (scope) async {
-                            final newCfg = vm.config.copyWith(scope: scope);
-                            final newS3Cfg = s3Vm.config.copyWith(scope: scope);
-                            vm.updateConfig(newCfg);
-                            s3Vm.updateConfig(newS3Cfg);
-                            await settings.setWebDavConfig(newCfg);
-                            await settings.setS3Config(newS3Cfg);
-                          },
-                  ),
+                  children: [
+                    BackupScopeTile(
+                      scope: cfg.scope,
+                      onChanged: vm.busy || s3Vm.busy
+                          ? null
+                          : (scope) async {
+                              final newCfg = vm.config.copyWith(scope: scope);
+                              final newS3Cfg = s3Vm.config.copyWith(
+                                scope: scope,
+                              );
+                              vm.updateConfig(newCfg);
+                              s3Vm.updateConfig(newS3Cfg);
+                              await settings.setWebDavConfig(newCfg);
+                              await settings.setS3Config(newS3Cfg);
+                            },
+                    ),
+                    _iosDivider(context),
+                    BackupEncryptionTile(
+                      enabled: settings.backupEncryptionEnabled,
+                      onChanged: vm.busy || s3Vm.busy
+                          ? null
+                          : settings.setBackupEncryptionPassword,
+                    ),
+                  ],
                 ),
 
                 ..._buildMobileLocalBackupSection(context, l10n, vm, header),
@@ -637,6 +649,10 @@ class _BackupPageState extends State<BackupPage> {
                                                   onProgress: handle.report,
                                                   cancelToken:
                                                       handle.cancelToken,
+                                                  onPassword:
+                                                      backupPasswordPrompt(
+                                                        context,
+                                                      ),
                                                   onForwardCompatibility:
                                                       forwardCompatibilityPrompt(
                                                         context,
@@ -711,6 +727,9 @@ class _BackupPageState extends State<BackupPage> {
                                           mode: mode,
                                           onProgress: handle.report,
                                           cancelToken: handle.cancelToken,
+                                          onPassword: backupPasswordPrompt(
+                                            context,
+                                          ),
                                           onForwardCompatibility:
                                               forwardCompatibilityPrompt(
                                                 context,
@@ -765,6 +784,9 @@ class _BackupPageState extends State<BackupPage> {
                                 title: l10n.backupPageBackupNow,
                                 task: (handle) async {
                                   final ok = await vm.backup(
+                                    password: await backupPasswordForExport(
+                                      context,
+                                    ),
                                     onProgress: handle.report,
                                     cancelToken: handle.cancelToken,
                                   );
@@ -1077,6 +1099,10 @@ class _BackupPageState extends State<BackupPage> {
                                                   onProgress: handle.report,
                                                   cancelToken:
                                                       handle.cancelToken,
+                                                  onPassword:
+                                                      backupPasswordPrompt(
+                                                        context,
+                                                      ),
                                                   onForwardCompatibility:
                                                       forwardCompatibilityPrompt(
                                                         context,
@@ -1150,6 +1176,9 @@ class _BackupPageState extends State<BackupPage> {
                                           mode: mode,
                                           onProgress: handle.report,
                                           cancelToken: handle.cancelToken,
+                                          onPassword: backupPasswordPrompt(
+                                            context,
+                                          ),
                                           onForwardCompatibility:
                                               forwardCompatibilityPrompt(
                                                 context,
@@ -1204,6 +1233,9 @@ class _BackupPageState extends State<BackupPage> {
                                 title: l10n.backupPageBackupNow,
                                 task: (handle) async {
                                   final ok = await s3Vm.backup(
+                                    password: await backupPasswordForExport(
+                                      context,
+                                    ),
                                     onProgress: handle.report,
                                     cancelToken: handle.cancelToken,
                                   );
@@ -1275,6 +1307,20 @@ class _BackupPageState extends State<BackupPage> {
           ),
         ],
       ),
+      if (Platform.isIOS)
+        Padding(
+          padding: const EdgeInsets.fromLTRB(12, 8, 12, 0),
+          child: Text(
+            l10n.backupPageIosSystemBackupNote,
+            style: TextStyle(
+              fontSize: 12,
+              height: 1.45,
+              color: Theme.of(
+                context,
+              ).colorScheme.onSurface.withValues(alpha: 0.55),
+            ),
+          ),
+        ),
     ];
   }
 
@@ -1392,6 +1438,7 @@ class _BackupPageState extends State<BackupPage> {
       ),
       task: (handle) async {
         file = await vm.exportToFile(
+          password: await backupPasswordForExport(context),
           onProgress: handle.report,
           cancelToken: handle.cancelToken,
         );
@@ -1427,7 +1474,9 @@ class _BackupPageState extends State<BackupPage> {
           dialogTitle: l10n.backupPageExportToFile,
           fileName: exported.uri.pathSegments.last,
           type: FileType.custom,
-          allowedExtensions: ['zip'],
+          allowedExtensions: [
+            exported.path.endsWith('.kbackup') ? 'kbackup' : 'zip',
+          ],
         );
         if (savePath != null) {
           try {
@@ -1458,8 +1507,9 @@ class _BackupPageState extends State<BackupPage> {
   Future<void> _doImportLocal(BuildContext context, BackupProvider vm) async {
     final l10n = AppLocalizations.of(context)!;
     final result = await FilePicker.platform.pickFiles(
-      type: FileType.custom,
-      allowedExtensions: ['zip'],
+      // Mobile MIME registries do not recognize .kbackup. Content inspection
+      // below validates both ordinary ZIPs and encrypted backups.
+      type: FileType.any,
     );
     final path = result?.files.single.path;
     if (path == null) return;
@@ -1486,6 +1536,8 @@ class _BackupPageState extends State<BackupPage> {
           mode: mode,
           onProgress: handle.report,
           cancelToken: handle.cancelToken,
+          onPassword: backupPasswordPrompt(context),
+          onForwardCompatibility: forwardCompatibilityPrompt(context),
           allowUnverifiedForwardCompatible:
               decision == ForwardCompatDecision.proceedUnverified,
         ),

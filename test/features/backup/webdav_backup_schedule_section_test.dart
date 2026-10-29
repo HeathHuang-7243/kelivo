@@ -231,6 +231,39 @@ void main() {
     },
   );
 
+  testWidgets('encrypted backups show password confirmation guidance', (
+    tester,
+  ) async {
+    final business = await createBusinessTestHarness(
+      initial: {
+        'webdav_config_v1': jsonEncode({'url': 'https://dav.example.com'}),
+      },
+    );
+    final store = _ScheduleStore()
+      ..state = const WebDavBackupScheduleState(
+        lastError: 'backup_password_required',
+      );
+    final provider = WebDavBackupScheduleProvider(
+      preferences: business.preferences,
+      backup: (_) async {},
+      store: store,
+      syncSchedule: (_) async {},
+      autoLoad: false,
+    );
+    addTearDown(provider.dispose);
+    await provider.refresh();
+    await tester.pumpWidget(_sectionHarness(provider));
+
+    expect(
+      find.text(
+        'Encrypted backups require password confirmation. Use manual WebDAV '
+        'backup, or turn off backup encryption to use scheduled backups.',
+      ),
+      findsOneWidget,
+    );
+    expect(find.textContaining('backup_password_required'), findsNothing);
+  });
+
   testWidgets('mobile interval selection returns chosen repeat interval', (
     tester,
   ) async {
@@ -299,6 +332,11 @@ void main() {
       expect(
         webDavScheduleErrorLabel(l10n, 'backup_busy'),
         l10n.webDavScheduleBackupBusy,
+      );
+      expect(
+        webDavScheduleErrorLabel(l10n, 'backup_password_required'),
+        'Encrypted backups require password confirmation. Use manual WebDAV '
+        'backup, or turn off backup encryption to use scheduled backups.',
       );
       expect(
         webDavScheduleErrorLabel(l10n, 'HTTP 401 at https://private.example'),

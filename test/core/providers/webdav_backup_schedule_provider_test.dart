@@ -93,6 +93,48 @@ void main() {
     },
   );
 
+  for (final force in [false, true]) {
+    test(
+      '${force ? 'run now' : 'due schedule'} waits for manual encryption confirmation without uploading',
+      () async {
+        final previous = now.subtract(const Duration(days: 3));
+        store.settings = WebDavBackupScheduleSettings(
+          enabled: true,
+          enabledAt: now.subtract(const Duration(days: 2)),
+        );
+        store.state = WebDavBackupScheduleState(lastSuccess: previous);
+        await session.preferences.setBool('backup_encryption_enabled_v1', true);
+        var uploads = 0;
+        var networkChecks = 0;
+        final vm = provider(
+          backup: (_) async => uploads++,
+          network: (_) async {
+            networkChecks++;
+            return true;
+          },
+        );
+
+        expect(await (force ? vm.runNow() : vm.runIfDue()), isFalse);
+        expect(uploads, 0);
+        expect(networkChecks, 0);
+        expect(vm.state.lastSuccess, previous);
+        expect(vm.state.lastAttempt, isNull);
+        expect(vm.state.lastError, 'backup_password_required');
+        expect(store.state.lastError, 'backup_password_required');
+        expect(BackupActivity.isActive, isFalse);
+
+        await session.preferences.setBool(
+          'backup_encryption_enabled_v1',
+          false,
+        );
+        expect(await vm.runNow(), isTrue);
+        expect(uploads, 1);
+        expect(vm.state.lastError, isNull);
+        vm.dispose();
+      },
+    );
+  }
+
   test(
     'only one backup runs and success is recorded after upload completes',
     () async {
