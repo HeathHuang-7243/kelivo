@@ -1,0 +1,31 @@
+{
+  "source_commit": "6ebd2fcd8ae7a4f92547b0fc7b0864d6b5f6ca60",
+  "source_url": "https://github.com/HeathHuang-7243/kelivo/commit/6ebd2fcd8ae7a4f92547b0fc7b0864d6b5f6ca60",
+  "upstream_commit": "ca2721e07b31cc8acc331c7a9f400109f8c1e298",
+  "upstream_commits_integrated": 150,
+  "flutter": "3.47.6",
+  "dart": "3.13.5",
+  "build_type": "profile",
+  "application_id": "com.psyche.kelivo.webdavtest",
+  "application_label": "Kelivo WebDAV Test",
+  "version_name": "1.3.2",
+  "version_code": 2081,
+  "abi": "arm64-v8a",
+  "min_android_api": 24,
+  "target_android_api": 36,
+  "apk": "Kelivo-WebDAV-Test-1.3.2-arm64.apk",
+  "size_bytes": 61067806,
+  "sha256": "0bd7d208f845dc414482122ebc63bd64eb2666d8547a4a209d1f0b5878d1f2c6",
+  "validation": {
+    "apk_signature_verified": true,
+    "same_signing_certificate_as_previous_test_apk": true,
+    "zipalign_verified": true,
+    "workmanager_components_present": true,
+    "root_analyzer": "passed",
+    "root_tests_passed": 11038,
+    "root_tests_skipped": 8,
+    "markstream_analyzer": "passed",
+    "markstream_tests_passed": 321,
+    "physical_device_tested": false
+  }
+}
