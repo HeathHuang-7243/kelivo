@@ -35,6 +35,7 @@ void main() {
       expect(status.reason, isNull);
       expect(runtime.supportsPty, isFalse);
       expect(runtime.supportsSystemTerminal, isTrue);
+      expect(runtime.supportsFileManager, isTrue);
     });
 
     test('cancel of an unknown run is a no-op', () async {
@@ -222,12 +223,15 @@ void main() {
           '-p',
           '$childPid',
           '-o',
-          'pid=',
+          'stat=',
         ]);
+        final state = leftover.stdout.toString().trim();
+        // A container's PID 1 may leave an exited, reparented child unreaped.
+        // Zombies cannot run; any other remaining process state must fail.
         expect(
-          leftover.exitCode,
-          isNot(0),
-          reason: 'child $childPid still alive after cancellation',
+          state.isEmpty || state.startsWith('Z'),
+          isTrue,
+          reason: 'child $childPid still alive after cancellation: $state',
         );
       }
     }, skip: !isUnix);

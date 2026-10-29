@@ -19,6 +19,7 @@ android {
     defaultConfig {
         // TODO: Specify your own unique Application ID (https://developer.android.com/studio/build/application-id.html).
         applicationId = "com.psyche.kelivo"
+        manifestPlaceholders["appLabel"] = "Kelivo"
         // You can update the following values to match your application needs.
         // For more information, see: https://flutter.dev/to/review-gradle-config.
         minSdk = flutter.minSdkVersion
@@ -68,6 +69,16 @@ android {
     }
 
     buildTypes {
+        getByName("debug") {
+            // Keep test builds separate from the user's signed production app.
+            applicationIdSuffix = ".webdavtest"
+            manifestPlaceholders["appLabel"] = "Kelivo WebDAV Test"
+        }
+        getByName("profile") {
+            applicationIdSuffix = ".webdavtest"
+            manifestPlaceholders["appLabel"] = "Kelivo WebDAV Test"
+            signingConfig = signingConfigs.getByName("debug")
+        }
         getByName("release") {
             if (keystorePropertiesFile.exists()) {
                 signingConfig = signingConfigs.getByName("release")
@@ -122,6 +133,7 @@ tasks.whenTaskAdded {
 tasks.findByName("preBuild")?.dependsOn("fetchProot")
 
 dependencies {
+    implementation("androidx.appcompat:appcompat:1.7.1")
     implementation("androidx.browser:browser:1.9.0")
     implementation("org.tukaani:xz:1.10")
     // Required for core library desugaring (used by flutter_local_notifications)

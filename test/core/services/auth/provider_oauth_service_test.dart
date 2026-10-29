@@ -564,6 +564,7 @@ void main() {
           modelOverrides: {
             'kimi-display-id': {
               'apiModelId': 'kimi-k2.5',
+              'oauthProtocol': 'anthropic',
               'abilities': ['tool', 'reasoning'],
               'reasoning': {
                 'dialect': scenario.mode == 'adaptive'
@@ -576,7 +577,10 @@ void main() {
           },
         );
         await settings.setProviderConfig(original.id, original);
-        final resolved = await service.resolve(original);
+        final resolved = (await service.resolve(
+          original,
+        )).forModelProtocol('kimi-display-id');
+        expect(resolved.providerType, ProviderKind.claude);
         final requests = <http.Request>[];
         final client = service.authenticatedClient(
           MockClient((request) async {

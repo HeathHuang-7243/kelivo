@@ -6,8 +6,11 @@ import 'package:flutter_test/flutter_test.dart';
 import 'package:provider/provider.dart';
 
 import '../../../support/business_test_harness.dart';
+import 'package:Kelivo/core/database/composer_draft_store.dart';
 import 'package:Kelivo/core/models/chat_message.dart';
 import 'package:Kelivo/core/models/conversation.dart';
+import 'package:Kelivo/core/models/composer_draft.dart';
+import 'package:Kelivo/core/models/chat_input_data.dart';
 import 'package:Kelivo/core/providers/assistant_provider.dart';
 import 'package:Kelivo/core/providers/settings_provider.dart';
 import 'package:Kelivo/core/services/chat/chat_service.dart';
@@ -36,6 +39,10 @@ class _ControlledChatService extends ChatService {
   final List<String?> setCurrentCalls = <String?>[];
   String? _trackedCurrentConversationId;
   int checkpointWrites = 0;
+  ComposerDraftStore? controlledDrafts;
+
+  @override
+  ComposerDraftStore? get composerDrafts => controlledDrafts;
 
   List<ChatMessage> messagesOf(String id) =>
       _messagesByConversation[id] ?? const <ChatMessage>[];
@@ -170,6 +177,48 @@ class _ControlledChatService extends ChatService {
     String conversationId,
     Iterable<String> groupIds,
   ) async => const <String, int>{};
+}
+
+class _DelayedComposerDrafts extends ChangeNotifier
+    implements ComposerDraftStore {
+  final firstLoad = Completer<ComposerDraft>();
+  final entries = {
+    'conv-a': ComposerDraft(
+      conversationId: 'conv-a',
+      compose: const ComposerDraftInput(text: 'Existing A draft'),
+    ),
+    'conv-b': ComposerDraft(
+      conversationId: 'conv-b',
+      compose: const ComposerDraftInput(text: 'Existing B draft'),
+    ),
+  };
+
+  @override
+  bool get suspended => false;
+  @override
+  int get resetRevision => 0;
+  @override
+  int get externalRevision => 0;
+  @override
+  String? get externalOwner => null;
+  @override
+  Future<void> flush() async {}
+  @override
+  Future<ComposerDraft> load(String id, {String? assistantId}) =>
+      id == 'conv-a' && !firstLoad.isCompleted
+      ? firstLoad.future
+      : Future.value(entries[id]!);
+  @override
+  ComposerDraft? peek(String id) => entries[id];
+  @override
+  int inputEpoch(String id, {required String? editMessageId}) => 0;
+  @override
+  void setInput(String id, ComposerDraftInput input) {
+    entries[id]!.compose = input;
+  }
+
+  @override
+  dynamic noSuchMethod(Invocation invocation) => super.noSuchMethod(invocation);
 }
 
 ChatMessage _message(String conversationId, int index) {
@@ -395,6 +444,133 @@ void main() {
   }
 
   group('HomePageController conversation switch pipeline', () {
+    testWidgets('browser task leaves an existing message edit untouched', (
+      tester,
+    ) async {
+      await runAsDesktop(() async {
+        final message = _message('conv-a', 0);
+        final service = _ControlledChatService({
+          'conv-a': [message],
+        });
+        final controller = await pumpHarness(tester, service);
+        await switchAndSettle(tester, controller, service, 'conv-a');
+        await controller.startUserMessageEdit(message);
+        await tester.pump();
+        final before = controller.inputController.text;
+        expect(controller.isUserMessageEditActive, isTrue);
+        expect(
+          await controller.appendBrowserTaskDraft(
+            'Browser page context',
+            expectedConversationId: 'conv-a',
+          ),
+          isFalse,
+        );
+        expect(controller.inputController.text, before);
+        expect(controller.userMessageEditState?.messageId, message.id);
+        await tester.pump(const Duration(seconds: 5));
+        await tester.pumpWidget(const SizedBox());
+      });
+    });
+    testWidgets(
+      'browser task stays with its owner when a chat switch wins the draft await',
+      (tester) async {
+        await runAsDesktop(() async {
+          final service = _ControlledChatService({
+            'conv-a': [_message('conv-a', 0)],
+            'conv-b': [_message('conv-b', 0)],
+          });
+          final drafts = _DelayedComposerDrafts();
+          service.controlledDrafts = drafts;
+          final controller = await pumpHarness(tester, service);
+          await switchAndSettle(tester, controller, service, 'conv-a');
+          expect(controller.mediaController.restoringDraft, isTrue);
+          final appending = controller.appendBrowserTaskDraft(
+            'Page task for A',
+            expectedConversationId: 'conv-a',
+          );
+          await switchAndSettle(tester, controller, service, 'conv-b');
+          drafts.firstLoad.complete(drafts.entries['conv-a']);
+          expect(await appending, isFalse);
+          expect(controller.currentConversation?.id, 'conv-b');
+          expect(controller.inputController.text, 'Existing B draft');
+          expect(drafts.entries['conv-b']!.compose.text, 'Existing B draft');
+          await switchAndSettle(tester, controller, service, 'conv-a');
+          expect(
+            controller.inputController.text,
+            'Existing A draft\n\nPage task for A',
+          );
+          expect(
+            drafts.entries['conv-a']!.compose.text,
+            'Existing A draft\n\nPage task for A',
+          );
+          expect(NotificationService.takePendingComposerText('conv-a'), isNull);
+          expect(NotificationService.takePendingComposerText('conv-b'), isNull);
+          expect(tester.takeException(), isNull);
+          await tester.pumpWidget(const SizedBox());
+          drafts.dispose();
+        });
+      },
+    );
+    testWidgets(
+      'browser entry appends a draft without sending or replacing existing text',
+      (tester) async {
+        await runAsDesktop(() async {
+          final service = _ControlledChatService({
+            'conv-a': [_message('conv-a', 0)],
+          });
+          final controller = await pumpHarness(tester, service);
+          await switchAndSettle(tester, controller, service, 'conv-a');
+          controller.inputController.text = 'Existing request';
+          controller.mediaController.restoreDraft(
+            const ComposerDraftInput(
+              text: 'Existing request',
+              documents: [
+                DocumentAttachment(
+                  path: '/draft/notes.txt',
+                  fileName: 'notes.txt',
+                  mime: 'text/plain',
+                ),
+              ],
+            ),
+          );
+          controller.debugSetChatInitialized();
+          final before = service.messagesOf('conv-a').length;
+          NotificationService.openConversation(
+            'conv-a',
+            composerText: 'Browser page context',
+          );
+          for (
+            var i = 0;
+            i < 20 &&
+                !controller.inputController.text.contains(
+                  'Browser page context',
+                );
+            i++
+          ) {
+            await tester.pump(const Duration(milliseconds: 10));
+          }
+          expect(
+            controller.inputController.text,
+            'Existing request\n\nBrowser page context',
+          );
+          expect(service.messagesOf('conv-a'), hasLength(before));
+          expect(
+            controller.mediaController
+                .snapshotDraft(controller.inputController.text)
+                .documents
+                .single
+                .path,
+            '/draft/notes.txt',
+          );
+          expect(
+            controller.inputController.selection.extentOffset,
+            controller.inputController.text.length,
+          );
+          expect(tester.takeException(), isNull);
+          await tester.pumpWidget(const SizedBox());
+        });
+      },
+    );
     testWidgets(
       'desktop task history opens the saved conversation through the bus',
       (tester) async {
@@ -673,14 +849,9 @@ void main() {
     void enterSelection(HomePageController controller) {
       final messages = controller.messages.toList();
       expect(messages, isNotEmpty);
-      controller.startMessageSelection(
-        messageIndex: 0,
-        messageList: messages,
-        mode: ChatSelectionMode.delete,
-      );
+      controller.startMessageSelection(messageIndex: 0, messageList: messages);
       expect(controller.selecting, isTrue);
       expect(controller.selectedItems, isNotEmpty);
-      expect(controller.selectionMode, ChatSelectionMode.delete);
     }
 
     testWidgets('successful switch clears selection UI and old ids', (
@@ -701,7 +872,6 @@ void main() {
         expect(controller.currentConversation?.id, 'conv-b');
         expect(controller.selecting, isFalse);
         expect(controller.selectedItems, isEmpty);
-        expect(controller.selectionMode, ChatSelectionMode.share);
         expect(
           previousSelected.intersection(controller.selectedItems),
           isEmpty,
@@ -730,7 +900,6 @@ void main() {
         expect(controller.currentConversation?.id, 'conv-a');
         expect(controller.selecting, isTrue);
         expect(controller.selectedItems, selectedBefore);
-        expect(controller.selectionMode, ChatSelectionMode.delete);
       });
     });
 
@@ -750,7 +919,6 @@ void main() {
         expect(controller.currentConversation?.id, 'conv-a');
         expect(controller.selecting, isTrue);
         expect(controller.selectedItems, selectedBefore);
-        expect(controller.selectionMode, ChatSelectionMode.delete);
       });
     });
 
@@ -769,7 +937,6 @@ void main() {
         expect(controller.currentConversation?.id, isNot('conv-a'));
         expect(controller.selecting, isFalse);
         expect(controller.selectedItems, isEmpty);
-        expect(controller.selectionMode, ChatSelectionMode.share);
       });
     });
   });
@@ -778,14 +945,9 @@ void main() {
     void enterSelection(HomePageController controller) {
       final messages = controller.messages.toList();
       expect(messages, isNotEmpty);
-      controller.startMessageSelection(
-        messageIndex: 0,
-        messageList: messages,
-        mode: ChatSelectionMode.delete,
-      );
+      controller.startMessageSelection(messageIndex: 0, messageList: messages);
       expect(controller.selecting, isTrue);
       expect(controller.selectedItems, isNotEmpty);
-      expect(controller.selectionMode, ChatSelectionMode.delete);
     }
 
     testWidgets('successful switch clears selection', (tester) async {
@@ -805,7 +967,6 @@ void main() {
         expect(service.currentConversationId, 'conv-b');
         expect(controller.selecting, isFalse);
         expect(controller.selectedItems, isEmpty);
-        expect(controller.selectionMode, ChatSelectionMode.share);
         expect(
           previousSelected.intersection(controller.selectedItems),
           isEmpty,
@@ -851,7 +1012,6 @@ void main() {
           expect(controller.messages.map((m) => m.id), messagesBefore);
           expect(controller.selecting, isTrue);
           expect(controller.selectedItems, selectedBefore);
-          expect(controller.selectionMode, ChatSelectionMode.delete);
         });
       },
     );
