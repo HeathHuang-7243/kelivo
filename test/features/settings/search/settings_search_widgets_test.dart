@@ -11,6 +11,7 @@ import 'package:Kelivo/features/settings/widgets/settings_search_field.dart';
 import 'package:Kelivo/features/settings/widgets/settings_search_view.dart';
 import 'package:Kelivo/l10n/app_localizations.dart';
 import 'package:Kelivo/l10n/app_localizations_en.dart';
+import 'package:Kelivo/l10n/app_language.dart';
 import 'package:Kelivo/shared/widgets/ios_switch.dart';
 import 'package:flutter/material.dart';
 import 'package:flutter/foundation.dart'
@@ -442,6 +443,91 @@ void main() {
     expect(tester.takeException(), isNull);
     debugDefaultTargetPlatformOverride = null;
   });
+
+  for (final query in ['a', '']) {
+    testWidgets('arrow down returns to the first entry for "$query"', (
+      tester,
+    ) async {
+      final index = SettingsSearchIndex(
+        AppLocalizationsEn(),
+        platform: TargetPlatform.macOS,
+      );
+      SettingsSearchItem? selected;
+      await pump(
+        tester,
+        Scaffold(
+          body: SettingsSearchView(
+            index: index,
+            onSelected: (item) => selected = item,
+            onClose: _noop,
+          ),
+        ),
+        platform: TargetPlatform.macOS,
+        size: const Size(390, 360),
+      );
+      await tester.enterText(find.byType(TextField), query);
+      await tester.pumpAndSettle();
+      final first = query.isEmpty
+          ? index.suggestions.first
+          : index.search(query).first;
+      final list = tester.widget<ListView>(find.byType(ListView));
+      list.controller!.jumpTo(list.controller!.position.maxScrollExtent);
+      await tester.pumpAndSettle();
+      if (query.isNotEmpty) {
+        expect(find.byKey(ValueKey(first.id)), findsNothing);
+      }
+      await tester.tap(find.byType(TextField));
+      await tester.sendKeyEvent(LogicalKeyboardKey.arrowDown);
+      await tester.pumpAndSettle();
+      await tester.sendKeyEvent(LogicalKeyboardKey.enter);
+      await tester.pumpAndSettle();
+      expect(selected?.id, first.id);
+      expect(tester.takeException(), isNull);
+      debugDefaultTargetPlatformOverride = null;
+    });
+  }
+
+  testWidgets('arrow down with no results keeps the query focused', (
+    tester,
+  ) async {
+    await pump(
+      tester,
+      Scaffold(
+        body: SettingsSearchView(
+          index: SettingsSearchIndex(
+            AppLocalizationsEn(),
+            platform: TargetPlatform.macOS,
+          ),
+          onSelected: (_) => fail('No result should activate'),
+          onClose: () => fail('Arrow Down must not select Cancel'),
+        ),
+      ),
+      platform: TargetPlatform.macOS,
+    );
+    await tester.enterText(
+      find.byType(TextField),
+      'no-such-setting-0123456789',
+    );
+    await tester.pumpAndSettle();
+    await tester.sendKeyEvent(LogicalKeyboardKey.arrowDown);
+    await tester.pumpAndSettle();
+    expect(
+      tester.widget<TextField>(find.byType(TextField)).focusNode!.hasFocus,
+      isTrue,
+    );
+    await tester.sendKeyEvent(LogicalKeyboardKey.enter);
+    await tester.pumpAndSettle();
+    expect(find.text('no-such-setting-0123456789'), findsOneWidget);
+    await tester.enterText(find.byType(TextField), 'font size');
+    await tester.pumpAndSettle();
+    expect(
+      tester.widget<TextField>(find.byType(TextField)).focusNode!.hasFocus,
+      isTrue,
+    );
+    expect(tester.takeException(), isNull);
+    debugDefaultTargetPlatformOverride = null;
+  });
+
   testWidgets('color picker uses the locale changed through a search result', (
     tester,
   ) async {
@@ -463,7 +549,7 @@ void main() {
             .hitTestable(),
       );
       await tester.pumpAndSettle();
-      await tester.tap(find.text('Simplified Chinese'));
+      await tester.tap(find.text(AppLanguage.simplifiedChinese.nativeName));
       await tester.pumpAndSettle();
       expect(settings.appLocale.languageCode, 'zh');
       await tester.binding.handlePopRoute();

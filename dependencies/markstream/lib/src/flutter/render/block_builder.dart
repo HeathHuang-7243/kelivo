@@ -3,7 +3,8 @@ import 'package:flutter/material.dart';
 
 import '../../core/ast/nodes.dart';
 import '../../core/text_index/text_index.dart';
-import '../../core/html/html_fragment.dart' show htmlBlockTags;
+import '../../core/html/html_fragment.dart'
+    show htmlBlockTags, isNativeHtmlTableRow;
 import '../../core/serialize/to_plain_text.dart';
 import '../extensions/registry.dart';
 import '../selection/document_selection.dart';
@@ -37,7 +38,10 @@ class MarkstreamRenderer {
   ImageBuilder? imageBuilder;
   LinkHandler? linkHandler;
   late InlineSpanBuilder _inline;
+  MarkstreamRenderer? _blockContentRenderer;
   late CodeBlockOptions codeOptions;
+  DetailsExpansionState? detailsExpansionState;
+  late Object detailsStateKey;
   late MarkstreamLabels labels;
   bool exporting = false;
   bool trackSelection = false;
@@ -52,6 +56,8 @@ class MarkstreamRenderer {
     ImageBuilder? imageBuilder,
     LinkHandler? linkHandler,
     required CodeBlockOptions codeOptions,
+    DetailsExpansionState? detailsExpansionState,
+    required Object detailsStateKey,
     required MarkstreamLabels labels,
     required bool exporting,
     required bool trackSelection,
@@ -65,6 +71,8 @@ class MarkstreamRenderer {
     this.imageBuilder = imageBuilder;
     this.linkHandler = linkHandler;
     this.codeOptions = codeOptions;
+    this.detailsExpansionState = detailsExpansionState;
+    this.detailsStateKey = detailsStateKey;
     this.labels = labels;
     this.exporting = exporting;
     this.trackSelection = trackSelection;
@@ -79,7 +87,36 @@ class MarkstreamRenderer {
       linkHandler: linkHandler,
       highlights: highlights,
     );
+    _updateBlockContent();
   }
+
+  // Keep a live session for nested painted surfaces too. Cached fold/cell
+  // callbacks must read the latest document instead of retaining snapshots.
+  MarkstreamRenderer get _blockContent {
+    if (theme.body.color == theme.colors.ink) return this;
+    if (_blockContentRenderer == null) {
+      _blockContentRenderer = MarkstreamRenderer(recognizerFor);
+      _updateBlockContent();
+    }
+    return _blockContentRenderer!;
+  }
+
+  void _updateBlockContent() => _blockContentRenderer?.update(
+    document: document,
+    theme: theme.blockContentTheme,
+    extensions: extensions,
+    codeHighlighter: codeHighlighter,
+    mathRenderer: mathRenderer,
+    imageBuilder: imageBuilder,
+    linkHandler: linkHandler,
+    codeOptions: codeOptions,
+    detailsExpansionState: detailsExpansionState,
+    detailsStateKey: detailsStateKey,
+    labels: labels,
+    exporting: exporting,
+    trackSelection: trackSelection,
+    highlights: highlights,
+  );
 
   MarkstreamRenderContext contextFor(BuildContext context, bool streaming) =>
       MarkstreamRenderContext(
@@ -254,7 +291,7 @@ class MarkstreamRenderer {
         labels: labels,
         streaming: streaming,
         exporting: exporting,
-        buildCell: (context, cell, style) => inlineText(
+        buildCell: (context, cell, style) => _blockContent.inlineText(
           context,
           cell,
           cell.children,
@@ -265,6 +302,7 @@ class MarkstreamRenderer {
     if (node is MathBlockNode)
       return MarkstreamMathBlock(
         node: node,
+        tex: node.tex,
         theme: theme,
         renderer: mathRenderer,
       );
@@ -272,6 +310,8 @@ class MarkstreamRenderer {
       final summary = node.children.whereType<DetailsSummaryNode>().firstOrNull;
       return MarkstreamDetailsBlock(
         node: node,
+        expansionState: detailsExpansionState,
+        stateKey: detailsStateKey,
         open: node.open,
         source: node.span.slice(document.source),
         theme: theme,
@@ -279,14 +319,14 @@ class MarkstreamRenderer {
             ? SelectionContainer.disabled(
                 child: Text(labels.details, style: theme.details.summary),
               )
-            : inlineText(
+            : _blockContent.inlineText(
                 context,
                 summary,
                 summary.children,
                 theme.details.summary,
                 streaming: streaming,
               ),
-        body: (context) => children(
+        body: (context) => _blockContent.children(
           context,
           node.children.where((child) => child is! DetailsSummaryNode).toList(),
           streaming: streaming,
@@ -402,7 +442,9 @@ class MarkstreamRenderer {
                                       ? TextAlign.end
                                       : TextAlign.center,
                                   style: body.copyWith(
-                                    color: theme.colors.ink3,
+                                    color: theme.proseInk.withValues(
+                                      alpha: theme.colors.ink3.a,
+                                    ),
                                     fontFeatures: const [
                                       FontFeature.tabularFigures(),
                                     ],

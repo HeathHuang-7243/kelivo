@@ -1,6 +1,7 @@
 import '../../core/ast/nodes.dart';
 import '../../core/ast/source_span.dart';
 import '../../core/ast/transform.dart';
+import '../../core/html/html_fragment.dart' show isNativeHtmlTableRow;
 import '../../core/text_index/text_index.dart';
 import '../../core/serialize/to_plain_text.dart';
 
@@ -11,6 +12,7 @@ DocumentNode selectedDocument(
   List<TextSegment> selected, {
   required Set<MarkdownNode> visible,
   required Set<MarkdownNode> complete,
+  Map<MarkdownNode, MarkdownNode> replacements = const {},
 }) {
   final completeHtmlTables = complete
       .whereType<HtmlElementNode>()
@@ -34,6 +36,11 @@ DocumentNode selectedDocument(
   final pending = <(MarkdownNode, bool)>[(document, false)];
   while (pending.isNotEmpty) {
     final (node, visited) = pending.removeLast();
+    final replacement = replacements[node];
+    if (replacement != null) {
+      converted[node] = replacement;
+      continue;
+    }
     final children = node is HtmlBlockNode && node.fullDocument
         ? node.rawFragments
         : node.children;
@@ -95,7 +102,7 @@ DocumentNode selectedDocument(
       continue;
     }
     if (node is HtmlElementNode &&
-        node.tag == 'tr' &&
+        isNativeHtmlTableRow(node) &&
         (kept.isNotEmpty ||
             node.children.any(visible.contains) &&
                 completeHtmlTables.any(

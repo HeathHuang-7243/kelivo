@@ -43,6 +43,8 @@ extension _HtmlBlockRenderer on MarkstreamRenderer {
             .firstOrNull;
         child = MarkstreamDetailsBlock(
           node: node,
+          expansionState: detailsExpansionState,
+          stateKey: detailsStateKey,
           source: node.span.slice(document.source),
           open: node.attributes.containsKey('open'),
           theme: theme,
@@ -50,17 +52,17 @@ extension _HtmlBlockRenderer on MarkstreamRenderer {
               ? SelectionContainer.disabled(
                   child: Text(labels.details, style: theme.details.summary),
                 )
-              : inlineText(
+              : _blockContent.inlineText(
                   context,
                   summary,
                   summary.children,
                   theme.details.summary,
                   streaming: streaming,
                 ),
-          body: (context) => htmlFlow(
+          body: (context) => _blockContent.htmlFlow(
             context,
             node.children.where((child) => !identical(child, summary)).toList(),
-            style,
+            style.copyWith(color: theme.colors.ink2),
             streaming: streaming,
           ),
         );
@@ -123,9 +125,9 @@ extension _HtmlBlockRenderer on MarkstreamRenderer {
             .where((n) => n.tag == 'code')
             .firstOrNull;
         final language =
-            RegExp(r'(?:^|\s)language-([\w+-]+)')
-                .firstMatch(code?.attributes['class'] ?? '')
-                ?.group(1) ??
+            RegExp(
+              r'(?:^|\s)language-([\w+-]+)',
+            ).firstMatch(code?.attributes['class'] ?? '')?.group(1) ??
             '';
         child = MarkstreamCodeBlock(
           node: CodeBlockNode(
@@ -177,47 +179,56 @@ extension _HtmlBlockRenderer on MarkstreamRenderer {
     TextStyle style,
     bool streaming,
   ) {
-    final items = node.children
-        .whereType<HtmlElementNode>()
-        .where((n) => n.tag == 'li')
-        .toList();
-    if (items.isEmpty)
-      return htmlFlow(context, node.children, style, streaming: streaming);
-    final start = int.tryParse(node.attributes['start'] ?? '') ?? 1;
+    final children = <Widget>[];
+    var run = <InlineNode>[];
+    var index = int.tryParse(node.attributes['start'] ?? '') ?? 1;
+    void flush() {
+      if (run.any((n) => n is! TextNode || n.text.trim().isNotEmpty)) {
+        children.add(htmlFlow(context, run, style, streaming: streaming));
+      }
+      run = [];
+    }
+
+    for (final item in node.children) {
+      if (item is! HtmlElementNode || item.tag != 'li') {
+        run.add(item);
+        continue;
+      }
+      flush();
+      children.add(
+        DocumentSelectionGroup(
+          node: item,
+          prefix: node.tag == 'ol' ? '$index. ' : '- ',
+          continuation: '  ',
+          child: Row(
+            crossAxisAlignment: CrossAxisAlignment.baseline,
+            textBaseline: TextBaseline.alphabetic,
+            children: [
+              Padding(
+                padding: theme.listMarkerPadding,
+                child: SelectionContainer.disabled(
+                  child: Text(node.tag == 'ol' ? '$index.' : '•', style: style),
+                ),
+              ),
+              Expanded(
+                child: htmlFlow(
+                  context,
+                  item.children,
+                  style,
+                  streaming: streaming,
+                ),
+              ),
+            ],
+          ),
+        ),
+      );
+      index++;
+    }
+    flush();
     return Column(
       mainAxisSize: MainAxisSize.min,
       crossAxisAlignment: CrossAxisAlignment.start,
-      children: [
-        for (var i = 0; i < items.length; i++)
-          DocumentSelectionGroup(
-            node: items[i],
-            prefix: node.tag == 'ol' ? '${start + i}. ' : '- ',
-            continuation: '  ',
-            child: Row(
-              crossAxisAlignment: CrossAxisAlignment.baseline,
-              textBaseline: TextBaseline.alphabetic,
-              children: [
-                Padding(
-                  padding: theme.listMarkerPadding,
-                  child: SelectionContainer.disabled(
-                    child: Text(
-                      node.tag == 'ol' ? '${start + i}.' : '•',
-                      style: style,
-                    ),
-                  ),
-                ),
-                Expanded(
-                  child: htmlFlow(
-                    context,
-                    items[i].children,
-                    style,
-                    streaming: streaming,
-                  ),
-                ),
-              ],
-            ),
-          ),
-      ],
+      children: children,
     );
   }
 
@@ -227,19 +238,57 @@ extension _HtmlBlockRenderer on MarkstreamRenderer {
     TextStyle style,
     bool streaming,
   ) {
-    final rows = <HtmlElementNode>[];
+    final children = <Widget>[];
+    var rows = <HtmlElementNode>[];
+    var run = <InlineNode>[];
+    void flushRows() {
+      if (rows.isNotEmpty) {
+        children.add(_htmlTableRows(context, rows, streaming));
+        rows = [];
+      }
+    }
+
+    void flushRun() {
+      if (run.isNotEmpty) {
+        children.add(htmlFlow(context, run, style, streaming: streaming));
+        run = [];
+      }
+    }
+
     void collect(HtmlElementNode element) {
-      for (final child in element.children.whereType<HtmlElementNode>()) {
-        if (child.tag == 'tr')
-          rows.add(child);
-        else if (const {'thead', 'tbody', 'tfoot'}.contains(child.tag))
+      for (final child in element.children) {
+        if (child is TextNode && child.text.trim().isEmpty) {
+          if (run.isNotEmpty) run.add(child);
+          continue;
+        }
+        if (child is HtmlElementNode &&
+            const {'thead', 'tbody', 'tfoot'}.contains(child.tag)) {
           collect(child);
+        } else if (isNativeHtmlTableRow(child)) {
+          flushRun();
+          rows.add(child as HtmlElementNode);
+        } else {
+          flushRows();
+          run.add(child);
+        }
       }
     }
 
     collect(node);
-    if (rows.isEmpty)
-      return htmlFlow(context, node.children, style, streaming: streaming);
+    flushRows();
+    flushRun();
+    return Column(
+      mainAxisSize: MainAxisSize.min,
+      crossAxisAlignment: CrossAxisAlignment.start,
+      children: children,
+    );
+  }
+
+  Widget _htmlTableRows(
+    BuildContext context,
+    List<HtmlElementNode> rows,
+    bool streaming,
+  ) {
     final cells = [
       for (final row in rows)
         row.children
@@ -255,8 +304,9 @@ extension _HtmlBlockRenderer on MarkstreamRenderer {
       for (final row in cells)
         for (final cell in row) cell.span: cell,
     };
+    final span = SourceSpan(rows.first.span.start, rows.last.span.end);
     final table = TableNode(
-      span: node.span,
+      span: span,
       alignments: List.filled(columns, TableAlignment.none),
       children: [
         for (var row = 0; row < rows.length; row++)
@@ -279,7 +329,7 @@ extension _HtmlBlockRenderer on MarkstreamRenderer {
     );
     return MarkstreamTableBlock(
       node: table,
-      source: node.span.slice(document.source),
+      source: span.slice(document.source),
       theme: theme,
       extensions: extensions,
       labels: labels,
@@ -287,7 +337,7 @@ extension _HtmlBlockRenderer on MarkstreamRenderer {
       exporting: exporting,
       buildCell: (context, cell, style) {
         final owner = owners[cell.span];
-        final content = inlineText(
+        final content = _blockContent.inlineText(
           context,
           owner ?? cell,
           cell.children,
@@ -297,13 +347,20 @@ extension _HtmlBlockRenderer on MarkstreamRenderer {
         if (owner == null) return content;
         return DocumentSelectionGroup(
           node: owner,
-          child: Align(
-            alignment: switch (owner.attributes['align']) {
-              'center' => Alignment.center,
-              'right' => Alignment.centerRight,
-              _ => AlignmentDirectional.centerStart,
+          child: DefaultTextStyle.merge(
+            textAlign: switch (owner.attributes['align']) {
+              'center' => TextAlign.center,
+              'right' => TextAlign.right,
+              _ => TextAlign.start,
             },
-            child: content,
+            child: Align(
+              alignment: switch (owner.attributes['align']) {
+                'center' => Alignment.center,
+                'right' => Alignment.centerRight,
+                _ => AlignmentDirectional.centerStart,
+              },
+              child: content,
+            ),
           ),
         );
       },

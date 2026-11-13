@@ -10,6 +10,7 @@ import '../../home/services/ask_user_interaction_service.dart';
 import '../../home/services/local_tools_service.dart';
 import 'screen_time_tool_ui.dart';
 import 'weather_tool_ui.dart';
+import 'package:Kelivo/theme/app_font_weights.dart';
 
 /// Built-in search is cited elsewhere and must not create a timeline card.
 const String kBuiltinSearchToolName = 'builtin_search';
@@ -434,7 +435,7 @@ double estimateToolExtraHeight({
   }
 
   if (!hideToolResultImages && imagePaths.isNotEmpty) {
-    extra += _estimateToolImageHeight;
+    extra += timelineToolImageHeight;
     if (hasSummary) extra += _estimateToolImageSummaryGap;
   }
 
@@ -535,7 +536,7 @@ bool _workspaceEstimateEnvNotReady(Map<String, dynamic>? metadata) {
 }
 
 const double _estimateTtsReplayRowHeight = 36;
-const double _estimateToolImageHeight = 120;
+const double timelineToolImageHeight = 120;
 const double _estimateToolImageSummaryGap = 8;
 const double _estimateAskUserOptionHeight = 40;
 const double _estimateAskUserOptionGap = 7;
@@ -557,7 +558,7 @@ double _estimateAskUserOptionRowHeight(
     fontSize: fontSize,
     height: 1.25,
     maxWidth: optionTextWidth,
-    fontWeight: FontWeight.w500,
+    fontWeight: AppFontWeights.medium,
   );
   return math.max(
     _estimateAskUserOptionHeight * fontScale,
@@ -662,7 +663,7 @@ double _estimateAskUserAnsweredExtra(
       fontSize: questionFontSize,
       height: 1.35,
       maxWidth: innerWidth,
-      fontWeight: FontWeight.w600,
+      fontWeight: AppFontWeights.semibold,
     );
     extra += _estimateAskUserAnsweredGap;
     extra += _askUserLayoutHeight(
@@ -670,7 +671,7 @@ double _estimateAskUserAnsweredExtra(
       fontSize: answerFontSize,
       height: 1.35,
       maxWidth: innerWidth,
-      fontWeight: FontWeight.w600,
+      fontWeight: AppFontWeights.semibold,
     );
     extra += _estimateAskUserAnsweredPad;
     if (i != questions.length - 1) extra += 10;
