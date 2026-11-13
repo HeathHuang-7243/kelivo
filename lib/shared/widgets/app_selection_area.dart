@@ -1,5 +1,3 @@
-import 'ios_tactile.dart';
-import 'option_sheet.dart';
 import 'dart:async';
 
 import 'package:flutter/foundation.dart';
@@ -7,7 +5,6 @@ import 'package:flutter/material.dart';
 import 'package:flutter/services.dart';
 import 'package:flutter/gestures.dart' show kSecondaryMouseButton;
 import 'package:uuid/uuid.dart';
-import 'package:lucide_icons_flutter/lucide_icons.dart';
 import '../../core/models/chat_message.dart';
 import '../../core/models/quote_ref.dart';
 import '../../features/chat/models/selection_snapshot.dart';
@@ -19,6 +16,7 @@ import '../../features/chat/widgets/selection_result_panel.dart';
 import 'package:super_clipboard/super_clipboard.dart' show ClipboardWriter;
 import '../markdown/rich_clipboard.dart';
 import 'app_text_selection_toolbar.dart';
+import 'android_text_selection_toolbar.dart';
 import 'snackbar.dart';
 import 'selection_scroll_container.dart';
 
@@ -41,6 +39,7 @@ class AppSelectionArea extends StatefulWidget {
     this.sourceOffset,
     this.sourceMap,
     this.onQuoteSelected,
+    this.quoteTextOnly = false,
   });
 
   final Widget child;
@@ -53,6 +52,9 @@ class AppSelectionArea extends StatefulWidget {
   final int? sourceOffset;
   final SourceTextMap? sourceMap;
   final VoidCallback? onQuoteSelected;
+
+  /// Capture a quote chip without linking its text to message body offsets.
+  final bool quoteTextOnly;
 
   @override
   State<AppSelectionArea> createState() => _AppSelectionAreaState();
@@ -128,6 +130,18 @@ class _AppSelectionAreaState extends State<AppSelectionArea> {
         ? _markdownSelection.selectedPlainText
         : _selectionKey.currentState?.selectedText ?? _selectedText;
     if (message == null || text.trim().isEmpty) return null;
+    if (widget.quoteTextOnly) {
+      return SelectionSnapshot(
+        messageId: message.id,
+        role: message.role,
+        start: 0,
+        end: 0,
+        text: text,
+        markdown: _markdownSelection.hasSelection
+            ? _markdownSelection.selectedMarkdown
+            : text,
+      );
+    }
     final source = widget.sourceText ?? message.content;
     final ranges =
         _markdownSelection.selections
@@ -196,10 +210,11 @@ class _AppSelectionAreaState extends State<AppSelectionArea> {
     );
   }
 
-  Rect _selectionAnchor() {
+  Rect _selectionAnchor({Offset? fallbackAnchor}) {
     final rects = _selectionKey.currentState?.globalSelectionRects;
     if (rects != null && rects.isNotEmpty) return rects.first;
     final anchor =
+        fallbackAnchor ??
         _areaKey
             .currentState
             ?.selectableRegion
@@ -259,6 +274,7 @@ class _AppSelectionAreaState extends State<AppSelectionArea> {
           text: snapshot.text,
           model: message.modelId,
           createdAt: message.timestamp,
+          hasSourceRange: !widget.quoteTextOnly,
         ),
       ),
     );
@@ -395,15 +411,17 @@ class _AppSelectionAreaState extends State<AppSelectionArea> {
 
   Widget _buildMenu(BuildContext context, SelectableRegionState region) {
     final text = _selectedText;
+    // Reading these anchors consumes Flutter's saved right-click position.
     final anchors = region.contextMenuAnchors;
     final snapshot = _captureSelection();
     if (widget.message != null && snapshot != null) {
-      return _buildMessageMenu(context, region, snapshot);
+      return _buildMessageMenu(context, region, snapshot, anchors);
     }
     return AppTextSelectionToolbar(
       anchors: anchors,
       selectionContext: region.context,
       onDismiss: () => region.hideToolbar(false),
+      keepOpenOnSelectAll: false,
       buttonItems: [
         for (final item in region.contextMenuButtonItems)
           if (item.type == ContextMenuButtonType.copy && _hasCopyBudget)
@@ -454,10 +472,10 @@ class _AppSelectionAreaState extends State<AppSelectionArea> {
     BuildContext context,
     SelectableRegionState region,
     SelectionSnapshot snapshot,
+    TextSelectionToolbarAnchors anchors,
   ) {
     final l10n = AppLocalizations.of(context)!;
-    final anchors = region.contextMenuAnchors;
-    final anchor = _selectionAnchor();
+    final anchor = _selectionAnchor(fallbackAnchor: anchors.primaryAnchor);
     final items = region.contextMenuButtonItems;
     final selectedMarkdown = _markdownSelection.hasSelection
         ? snapshot.markdown
@@ -557,44 +575,36 @@ class _AppSelectionAreaState extends State<AppSelectionArea> {
         ],
       );
     }
-    return TextSelectionToolbar(
-      anchorAbove: anchors.primaryAnchor,
-      anchorBelow: anchors.secondaryAnchor ?? anchors.primaryAnchor,
-      children: [
-        for (final item in [
-          for (final item in items)
-            if (item.type != ContextMenuButtonType.selectAll)
-              item.type == ContextMenuButtonType.copy ? copy : item,
-          quote,
-          translate,
-          selectAll,
-        ])
-          TextSelectionToolbarTextButton(
-            padding: const EdgeInsets.symmetric(horizontal: 12),
-            onPressed: item.onPressed,
-            child: Text(
-              AdaptiveTextSelectionToolbar.getButtonLabel(context, item),
-            ),
-          ),
-        IosIconButton(
-          tooltip: MaterialLocalizations.of(context).moreButtonTooltip,
-          icon: LucideIcons.ellipsisVertical,
-          size: 18,
-          minSize: 44,
-          onTap: () async {
-            region.hideToolbar();
-            final item = await showOptionSheet<ContextMenuButtonItem>(
-              this.context,
-              title: MaterialLocalizations.of(this.context).copyButtonLabel,
-              items: [
-                for (final item in [markdown, rich])
-                  OptionSheetItem(value: item, label: item.label!),
-              ],
-            );
-            if (mounted) item?.onPressed?.call();
-          },
-        ),
-      ],
+    final overflowItems = [
+      for (final item in items)
+        if (item.type != ContextMenuButtonType.copy &&
+            item.type != ContextMenuButtonType.selectAll)
+          item,
+      selectAll,
+    ];
+    final buttonItems = [
+      copy,
+      quote,
+      translate,
+      markdown,
+      rich,
+      ...overflowItems,
+    ];
+    if (kIsWeb || defaultTargetPlatform != TargetPlatform.android) {
+      return AppTextSelectionToolbar(
+        anchors: anchors,
+        buttonItems: buttonItems,
+        selectionContext: region.context,
+        onDismiss: () => region.hideToolbar(false),
+      );
+    }
+    return AndroidTextSelectionToolbar(
+      anchors: anchors,
+      buttonItems: buttonItems,
+      overflowItems: overflowItems.toSet(),
+      selectionContext: region.context,
+      onDismiss: () => region.hideToolbar(false),
+      keepOpenOnSelectAll: false,
     );
   }
 

@@ -2,6 +2,7 @@ import 'dart:async';
 import 'package:flutter/material.dart';
 import 'package:flutter/rendering.dart';
 import 'package:super_sliver_list/super_sliver_list.dart';
+import '../../../shared/widgets/scroll_layout_anchor.dart';
 
 // ============================================================================
 // Auto-follow ScrollController / ScrollPosition
@@ -84,7 +85,8 @@ class ChatAutoFollowScrollController extends ScrollController {
   }
 }
 
-class _AutoFollowScrollPosition extends ScrollPositionWithSingleContext {
+class _AutoFollowScrollPosition extends ScrollPositionWithSingleContext
+    with ScrollLayoutAnchor {
   _AutoFollowScrollPosition({
     required super.physics,
     required super.context,
@@ -95,6 +97,7 @@ class _AutoFollowScrollPosition extends ScrollPositionWithSingleContext {
   final ChatAutoFollowScrollController controller;
 
   _IndexedScrollActivity beginIndexedAnimation(VoidCallback onCanceled) {
+    clearScrollLayoutAnchor();
     final indexedActivity = _IndexedScrollActivity(this, onCanceled);
     beginActivity(indexedActivity);
     return indexedActivity;
@@ -111,6 +114,22 @@ class _AutoFollowScrollPosition extends ScrollPositionWithSingleContext {
 
   void finishIndexedAnimation(_IndexedScrollActivity indexedActivity) {
     if (identical(activity, indexedActivity)) indexedActivity.finish();
+  }
+
+  @override
+  void jumpTo(double value) {
+    clearScrollLayoutAnchor();
+    super.jumpTo(value);
+  }
+
+  @override
+  Future<void> animateTo(
+    double to, {
+    required Duration duration,
+    required Curve curve,
+  }) {
+    clearScrollLayoutAnchor();
+    return super.animateTo(to, duration: duration, curve: curve);
   }
 
   @override
@@ -133,6 +152,7 @@ class _AutoFollowScrollPosition extends ScrollPositionWithSingleContext {
         (controller.shouldAutoFollow() &&
             userScrollDirection == ScrollDirection.idle);
     if (shouldPositionAtBottom) {
+      clearScrollLayoutAnchor();
       final gap = this.maxScrollExtent - pixels;
       if (gap > 0.5) {
         correctPixels(this.maxScrollExtent);
@@ -141,6 +161,7 @@ class _AutoFollowScrollPosition extends ScrollPositionWithSingleContext {
     }
     if (controller._preserveDistanceFromEndDuringLayout &&
         userScrollDirection == ScrollDirection.idle) {
+      clearScrollLayoutAnchor();
       final target =
           (this.maxScrollExtent - controller._preservedDistanceFromEnd).clamp(
             this.minScrollExtent,
@@ -151,7 +172,7 @@ class _AutoFollowScrollPosition extends ScrollPositionWithSingleContext {
         return false;
       }
     }
-    return result;
+    return result && applyScrollLayoutAnchor();
   }
 }
 
@@ -947,6 +968,23 @@ class ChatScrollController {
       }
       _lastJumpUserMessageId = targetId;
     } catch (_) {}
+  }
+
+  /// Center the quoted line inside the unobscured part of the chat viewport.
+  /// Its global geometry is re-read by the caller as lazy block heights settle.
+  void scrollToSourceRect(Rect rect, {required double bottomInset}) {
+    if (!_scrollController.hasClients) return;
+    final position = _scrollController.position;
+    final box = position.context.storageContext.findRenderObject();
+    if (box is! RenderBox || !box.hasSize) return;
+    _cancelProgrammaticNavigation(stopDrivenScroll: true);
+    _autoStickToBottom = false;
+    final top = box.localToGlobal(Offset.zero).dy + _currentTopRevealInset();
+    final bottom =
+        box.localToGlobal(Offset(0, box.size.height)).dy - bottomInset;
+    final target = (position.pixels + rect.center.dy - (top + bottom) / 2)
+        .clamp(position.minScrollExtent, position.maxScrollExtent);
+    if ((target - position.pixels).abs() > .5) position.jumpTo(target);
   }
 
   Future<void> _animateToMessageIndex({

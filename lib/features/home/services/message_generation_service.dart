@@ -1,3 +1,10 @@
+import '../../../core/services/tools/view_image_tool.dart';
+import '../../../core/models/native_compaction.dart';
+import '../../../core/models/compression_config.dart';
+import '../../../core/services/api/native_compaction_context.dart';
+import '../../../core/services/api/providers/zhipu_layout_parsing.dart';
+import '../../../core/models/context_operation.dart';
+import '../../../core/services/api/request_image_context.dart';
 import '../../intelligent_ui/host/ui_context_submission.dart';
 import 'package:Kelivo/core/providers/external_mounts_provider.dart';
 import 'dart:async';
@@ -18,6 +25,7 @@ import '../../../core/providers/settings_provider.dart';
 import '../../../core/providers/world_book_provider.dart';
 import '../../../core/services/api/builtin_tools.dart';
 import '../../../core/services/api/chat_api_service.dart';
+import '../../../core/services/api/response_speed.dart';
 import '../../../core/services/api/providers/openai/responses_history.dart';
 import '../../../core/services/api/reasoning/reasoning_dialects.dart';
 import '../../../core/services/model_spec/model_spec_resolver.dart';
@@ -26,6 +34,8 @@ import '../../../core/services/chat/chat_service.dart';
 import '../../../core/services/chat/document_text_extractor.dart';
 import '../../../l10n/app_localizations.dart';
 import '../../../core/services/logging/context_logger.dart';
+import '../../../core/services/logging/context_log_models.dart';
+import '../../../core/services/memory/memory_block_builder.dart';
 import '../../../core/services/skills/skills_service.dart';
 import '../../../core/services/workspace/workspace_runtime.dart';
 import '../../../core/services/mcp/mcp_tool_service.dart';
@@ -100,6 +110,7 @@ class PreparedGeneration {
   final List<String> lastUserImagePaths;
   final Object? contextUsageConfiguration;
   final int? contextUsageRevision;
+  final RequestImageContext? imageContext;
 
   PreparedGeneration({
     required this.apiMessages,
@@ -109,6 +120,7 @@ class PreparedGeneration {
     required this.lastUserImagePaths,
     this.contextUsageConfiguration,
     this.contextUsageRevision,
+    this.imageContext,
   });
 }
 
@@ -157,7 +169,12 @@ class MessageGenerationService {
 
   /// Packs system prompt, injections, history, and tool definitions without
   /// OCR, document extraction, or inline-image encoding.
+  /// Disable [applyMessageLimit] when compression already selected its range.
   Future<UnprocessedRequestContext> assembleUnprocessedRequestContext({
+    bool? fixedContextStart,
+    DateTime? promptTime,
+    bool forceResponses = false,
+    bool applyMessageLimit = true,
     required List<ChatMessage> messages,
     required Map<String, int> versionSelections,
     required Conversation? currentConversation,
@@ -171,16 +188,6 @@ class MessageGenerationService {
     bool persistWorldBookActivation = true,
     void Function(int before, int after)? onWorldBookActivationPersisted,
   }) async {
-    final cfg = settings
-        .getProviderConfig(providerKey)
-        .forModelProtocol(modelId);
-    final kind = ProviderConfig.classify(
-      providerKey,
-      explicitType: cfg.providerType,
-    );
-    final includeToolMessages = switch (kind) {
-      ProviderKind.openai || ProviderKind.claude || ProviderKind.google => true,
-    };
     WorkspaceProvider? workspaceProvider;
     WorkspaceRuntimeProvider? runtimeProvider;
     ExternalMountsProvider? externalMounts;
@@ -190,14 +197,41 @@ class MessageGenerationService {
       externalMounts = contextProvider.read<ExternalMountsProvider?>();
     } catch (_) {}
 
+    var cfg = settings.getProviderConfig(providerKey).forModelProtocol(modelId);
+    final compression = currentConversation == null
+        ? settings.compressionDefaults
+        : await chatService.compressionConfig(
+            currentConversation.id,
+            settings.compressionDefaults,
+          );
+    if (forceResponses ||
+        (compression.nativeEnabled &&
+            compression.mode == AutoCompressionMode.auto) ||
+        messages.any((m) => NativeCompactionPayload.forMessage(m) != null)) {
+      cfg = nativeResponsesConfig(cfg);
+    }
+    final kind = ProviderConfig.classify(
+      providerKey,
+      explicitType: cfg.providerType,
+    );
+    final includeToolMessages = switch (kind) {
+      ProviderKind.openai || ProviderKind.claude || ProviderKind.google => true,
+    };
+    final usesClaudeHistory =
+        kind == ProviderKind.claude ||
+        (kind == ProviderKind.google &&
+            cfg.vertexAI == true &&
+            modelId.toLowerCase().startsWith('claude-'));
+
     final apiMessages = messageBuilderService.buildApiMessages(
       messages: messages,
       versionSelections: versionSelections,
       currentConversation: currentConversation,
       includeToolMessages: includeToolMessages,
       // Claude replays its rounds from the native turn artifact instead.
-      preserveToolTurns: kind != ProviderKind.claude,
-      claudeSource: kind == ProviderKind.claude
+      preserveToolTurns: !usesClaudeHistory,
+      googleProviderId: kind == ProviderKind.google ? providerKey : null,
+      claudeSource: usesClaudeHistory
           ? (providerId: providerKey, modelId: modelId)
           : null,
       responsesScope: kind == ProviderKind.openai && cfg.useResponseApi == true
@@ -225,11 +259,25 @@ class MessageGenerationService {
         : chatService.getConversation(currentConversation.id) ??
               currentConversation;
 
+    // Select real history before prompt injections can add synthetic user
+    // turns. World-book scanning and placement then see the selected context.
+    final hasFixedStart =
+        fixedContextStart ??
+        (currentConversation != null &&
+            ContextHistory.fixedStart(
+                  chatService.contextOperationsFor(currentConversation.id),
+                ) !=
+                null);
+    if (applyMessageLimit && !hasFixedStart) {
+      messageBuilderService.applyContextLimit(apiMessages, assistant);
+    }
+
     messageBuilderService.injectSystemPrompt(
       apiMessages,
       assistant,
       modelId,
       conversation: promptConversation,
+      promptTime: promptTime,
     );
     await messageBuilderService.injectMemoryAndRecentChats(
       apiMessages,
@@ -299,7 +347,6 @@ class MessageGenerationService {
           assistant,
           conversationId: currentConversation?.id,
           workspaceContext: workspaceContext,
-          attachments: workspaceAttachments,
         );
       }
     } catch (e) {
@@ -314,8 +361,6 @@ class MessageGenerationService {
       conversationId: currentConversation?.id,
       workspaceContext: workspaceContext,
     );
-
-    messageBuilderService.applyContextLimit(apiMessages, assistant);
 
     final mcpRouteSnapshot = generationController.captureMcpToolRoutes(
       assistant,
@@ -342,12 +387,129 @@ class MessageGenerationService {
     );
   }
 
+  /// References for a historical summary must not assemble a new chat request:
+  /// that would refresh memory and world-book state from beyond its range.
+  Future<String> compressionReferenceText({
+    required String conversationId,
+    required String modelId,
+    required String? assistantId,
+    required List<ChatMessage> messages,
+    required DateTime promptTime,
+  }) async {
+    final assistant = assistantId == null
+        ? null
+        : contextProvider.read<AssistantProvider>().getById(assistantId);
+    final conversation = chatService.getConversation(conversationId);
+    final apiMessages = messageBuilderService.buildApiMessages(
+      messages: messages,
+      versionSelections: chatService.getVersionSelections(conversationId),
+      currentConversation: conversation?.copyWith(truncateIndex: -1),
+      includeToolMessages: false,
+    );
+    messageBuilderService.injectSystemPrompt(
+      apiMessages,
+      assistant,
+      modelId,
+      conversation: conversation,
+      promptTime: promptTime,
+    );
+    await messageBuilderService.injectInstructionPrompts(
+      apiMessages,
+      assistantId,
+      conversation: conversation,
+      conversationScoped: assistant?.allowConversationPromptInjection ?? false,
+    );
+    await messageBuilderService.injectWorldBookPrompts(
+      apiMessages,
+      assistantId,
+      conversation: conversation,
+      conversationScoped: assistant?.allowConversationPromptInjection ?? false,
+      sourceMessages: messages,
+      restrictToSourceMessages: true,
+      persistActivation: false,
+    );
+    // Use the last frozen snapshot in this range, without refreshing it from
+    // live memory or repeating superseded snapshots in a long conversation.
+    final prompts = await chatService.chatRepositoryOrNull?.getMessagePrompts(
+      messages.where((m) => m.role == 'user').map((m) => m.id),
+    );
+    for (final message in messages.reversed) {
+      final frozen = prompts?[message.id];
+      if (frozen == null || !frozen.carriesMemorySnapshot) continue;
+      final split = MemoryBlockBuilder.splitInjectedPrefix(frozen.payload);
+      if (split == null) continue;
+      final reference = <String, dynamic>{
+        'role': 'system',
+        'content': split.prefix,
+      };
+      ContextSegmentTags.replaceWithSingle(
+        reference,
+        source: ContextSource.memorySnapshot,
+        length: split.prefix.length,
+        meta: {'messageId': message.id},
+      );
+      apiMessages.add(reference);
+      break;
+    }
+    return ContextAssemblyPreview.fromApiMessages(
+      apiMessages: apiMessages,
+      tools: const [],
+      mcpToolNames: const {},
+      images: const [],
+    ).referenceText;
+  }
+
   Future<ContextAssemblyPreview> previewContextAssembly({
+    bool? fixedContextStart,
+    DateTime? promptTime,
+    bool forceResponses = false,
+    bool applyMessageLimit = true,
     required String conversationId,
     required String providerKey,
     required String modelId,
     required String? assistantId,
     List<ChatMessage>? messagesOverride,
+  }) => _contextAssembly(
+    fixedContextStart: fixedContextStart,
+    promptTime: promptTime,
+    forceResponses: forceResponses,
+    applyMessageLimit: applyMessageLimit,
+    conversationId: conversationId,
+    providerKey: providerKey,
+    modelId: modelId,
+    assistantId: assistantId,
+    messagesOverride: messagesOverride,
+    persistWorldBookActivation: false,
+  );
+
+  Future<ContextAssemblyPreview> prepareCompressedContext({
+    bool? fixedContextStart,
+    required String conversationId,
+    required String providerKey,
+    required String modelId,
+    required String? assistantId,
+    List<ChatMessage>? messagesOverride,
+  }) => _contextAssembly(
+    fixedContextStart: fixedContextStart,
+    conversationId: conversationId,
+    providerKey: providerKey,
+    modelId: modelId,
+    assistantId: assistantId,
+    messagesOverride: messagesOverride,
+    persistWorldBookActivation: true,
+  );
+
+  Future<ContextAssemblyPreview> _contextAssembly({
+    bool? fixedContextStart,
+    DateTime? promptTime,
+    bool forceResponses = false,
+    bool applyMessageLimit = true,
+    required String conversationId,
+    required String providerKey,
+    required String modelId,
+    required String? assistantId,
+    List<ChatMessage>? messagesOverride,
+    required bool persistWorldBookActivation,
   }) async {
     final settings = contextProvider.read<SettingsProvider>();
     Assistant? assistant;
@@ -360,11 +522,15 @@ class MessageGenerationService {
         messagesOverride ??
         await chatService.loadSelectedContextMessages(
           conversationId,
-          limit: assistant?.limitContextMessages == true
+          limit: applyMessageLimit && assistant?.limitContextMessages == true
               ? assistant!.contextMessageSize
               : 0x7fffffff,
         );
     final packed = await assembleUnprocessedRequestContext(
+      fixedContextStart: fixedContextStart,
+      promptTime: promptTime,
+      forceResponses: forceResponses,
+      applyMessageLimit: applyMessageLimit,
       messages: messages,
       versionSelections: chatService.getVersionSelections(conversationId),
       currentConversation: conversation?.copyWith(truncateIndex: -1),
@@ -374,7 +540,7 @@ class MessageGenerationService {
       providerKey: providerKey,
       modelId: modelId,
       syncWorkspaceAttachments: false,
-      persistWorldBookActivation: false,
+      persistWorldBookActivation: persistWorldBookActivation,
     );
     // Reuse the send path to include the live memory snapshot and frozen user
     // prompts. Previewing must never freeze a draft, run OCR, or write extras.
@@ -389,7 +555,28 @@ class MessageGenerationService {
           .spec(packed.cfg, modelId)
           .supportsPdfInput,
     );
+    final imageContext =
+        ChatApiService.supportsOpenAIImagesApiRouting(packed.cfg, modelId) ||
+            shouldUseZhipuLayoutParsing(packed.cfg, modelId)
+        ? null
+        : await _imageContext(
+            conversationId,
+            messages,
+            packed,
+            settings,
+            modelId,
+          );
+    if (imageContext != null) {
+      await imageContext.prepareMessages(
+        packed.apiMessages,
+        const [],
+        parseMarkdownImages: settings.sendMarkdownImageLinksAsImages,
+        allowRemoteImages: imageContext.allowsRemoteUserImages,
+      );
+    }
+    final imagePreview = await imageContext?.preview();
     return ContextAssemblyPreview.fromApiMessages(
+      imageContext: imageContext,
       apiMessages: packed.apiMessages,
       mcpToolNames: {
         for (final tool in packed.toolDefs)
@@ -398,10 +585,72 @@ class MessageGenerationService {
               name,
       },
       tools: packed.toolDefs,
-      images: imageRefsFromApiMessages(
-        packed.apiMessages,
-        sourceMessages: messages,
+      images: imagePreview == null
+          ? imageRefsFromApiMessages(
+              packed.apiMessages,
+              sourceMessages: messages,
+            )
+          : [
+              for (final image in imagePreview)
+                if (image.included) const ContextImageRef(),
+            ],
+    );
+  }
+
+  Future<RequestImageContext> _imageContext(
+    String conversationId,
+    List<ChatMessage> messages,
+    UnprocessedRequestContext packed,
+    SettingsProvider settings,
+    String modelId, {
+    bool omitImages = false,
+  }) async {
+    final cfg = packed.cfg;
+    final kind = ProviderConfig.classify(
+      cfg.id,
+      explicitType: cfg.providerType,
+    );
+    final original = await chatService.imageContextHistory(
+      conversationId,
+      throughMessageId: messages
+          .where((m) => !ContextOperation.isSummary(m))
+          .lastOrNull
+          ?.id,
+    );
+    final history =
+        chatService.chatRepositoryOrNull == null &&
+            !chatService.isTemporaryConversation(conversationId)
+        ? messages
+        : original;
+    final spec = ModelSpecResolver.instance.spec(cfg, modelId);
+    final remoteImages =
+        (kind == ProviderKind.openai && spec.remoteImageUrls) ||
+        (kind == ProviderKind.google &&
+            cfg.vertexAI == true &&
+            modelId.toLowerCase().startsWith('claude-'));
+    return RequestImageContext(
+      settings: await chatService.imageContextSettings(conversationId),
+      images: await RequestImageContext.collectHistory(
+        history,
+        parseMarkdownImages: settings.sendMarkdownImageLinksAsImages,
+        allowRemoteImages: remoteImages,
       ),
+      userTurns: RequestImageContext.userTurnsFor(history),
+      inlineRemoteUsers: kind == ProviderKind.google,
+      allowsRemoteUserImages: remoteImages,
+      omitUserImages: settings.ocrActive,
+      omitImages: omitImages,
+      latestUserId: history
+          .where((m) => m.role == 'user' && !ContextOperation.isSummary(m))
+          .lastOrNull
+          ?.id,
+      budget: cfg.requestBudgetForModel(modelId),
+      historyBudget: cfg.defaultRequestBudget,
+      canImageInput: spec.supportsImageInput,
+      canRecall: packed.toolDefs.any(ViewImageTool.supportsHistory),
+      viewImageUris: packed.toolDefs.any(ViewImageTool.supportsFiles)
+          ? {for (final file in packed.workspaceAttachments) file.sourceUri}
+          : {},
     );
   }
 
@@ -417,6 +666,7 @@ class MessageGenerationService {
     required String? assistantId,
     required String providerKey,
     required String modelId,
+    bool omitImages = false,
     ToolApprovalService? approvalService,
     AskUserInteractionService? askUserService,
     String? processingMessageId,
@@ -494,8 +744,7 @@ class MessageGenerationService {
               resolvedWorkspace.workspace.isToolEnabled(name as String);
         });
     final localAttachments = <String, AttachmentInfo>{
-      if (hasWorkspaceFileTools)
-        for (final file in workspaceAttachments) file.sourceUri: file,
+      for (final file in workspaceAttachments) file.sourceUri: file,
     };
     final indicatorMessageId =
         processingMessageId != null &&
@@ -507,10 +756,11 @@ class MessageGenerationService {
               sandboxDataFiles: sandboxDataFiles,
               nativePdfInput: nativePdfInput,
               workspaceAttachments: localAttachments,
+              useWorkspaceForDocuments: hasWorkspaceFileTools,
             )
         ? processingMessageId
         : null;
-    final List<String> lastUserImagePaths;
+    List<String> lastUserImagePaths;
     if (indicatorMessageId != null) {
       onFileProcessingStarted?.call(indicatorMessageId);
     }
@@ -525,6 +775,7 @@ class MessageGenerationService {
             sandboxDataFiles: sandboxDataFiles,
             nativePdfInput: nativePdfInput,
             workspaceAttachments: localAttachments,
+            useWorkspaceForDocuments: hasWorkspaceFileTools,
           );
     } on AttachmentRequiresWorkspace catch (e) {
       if (!contextProvider.mounted) rethrow;
@@ -540,41 +791,29 @@ class MessageGenerationService {
       }
     }
 
+    RequestImageContext? imageContext;
     if (currentConversation != null &&
-        chatService.contextOperationsFor(currentConversation.id).isNotEmpty) {
-      final window = ModelSpecResolver.instance
-          .spec(cfg, modelId)
-          .contextWindow;
-      if (window != null) {
-        final preview = ContextAssemblyPreview.fromApiMessages(
-          apiMessages: apiMessages,
-          tools: toolDefs,
-          mcpToolNames: const {},
-          images: imageRefsFromApiMessages(
-            apiMessages,
-            sourceMessages: messages,
-          ),
-        );
-        final used = estimateContextBuckets(
-          ContextEstimateJob(
-            preview: preview,
-            kind: ProviderConfig.classify(
-              providerKey,
-              explicitType: cfg.providerType,
-            ),
-          ),
-        ).total;
-        final reserve = assistant?.maxTokens ?? (window ~/ 10).clamp(1, 4096);
-        if (used + reserve > window) {
-          throw StateError(
-            contextProvider.mounted
-                ? AppLocalizations.of(contextProvider)!.contextBudgetExceeded
-                : 'context_budget_exceeded',
-          );
-        }
-      }
+        (omitImages ||
+            (!ChatApiService.supportsOpenAIImagesApiRouting(cfg, modelId) &&
+                !shouldUseZhipuLayoutParsing(cfg, modelId)))) {
+      imageContext = await _imageContext(
+        currentConversation.id,
+        messages,
+        packed,
+        settings,
+        modelId,
+        omitImages: omitImages,
+      );
+      lastUserImagePaths = await imageContext.prepareMessages(
+        apiMessages,
+        lastUserImagePaths,
+        parseMarkdownImages: settings.sendMarkdownImageLinksAsImages,
+        allowRemoteImages: imageContext.allowsRemoteUserImages,
+      );
+    } else {
+      await messageBuilderService.inlineLocalImages(apiMessages);
     }
-    await messageBuilderService.inlineLocalImages(apiMessages);
+
     if (ContextLogger.enabled) {
       final providerName = cfg.name.trim();
       ContextLogger.logPrepared(
@@ -605,8 +844,9 @@ class MessageGenerationService {
       onToolCall: onToolCall,
       hasBuiltInSearch: hasBuiltInSearch,
       lastUserImagePaths: lastUserImagePaths,
-      contextUsageConfiguration: requestConfiguration,
+      contextUsageConfiguration: omitImages ? null : requestConfiguration,
       contextUsageRevision: requestRevision,
+      imageContext: imageContext,
     );
   }
 
@@ -892,6 +1132,7 @@ class MessageGenerationService {
     required bool enableReasoning,
     required bool generateTitleOnFinish,
     String? generationRunId,
+    bool isContinuation = false,
     bool scheduled = false,
     bool scheduledNotify = true,
     bool scheduledPreview = true,
@@ -900,10 +1141,17 @@ class MessageGenerationService {
 
     return stream_ctrl.GenerationContext(
       assistantMessage: assistantMessage,
+      imageContext: prepared.imageContext
+        ?..targetMessageId = assistantMessage.id,
       apiMessages: prepared.apiMessages,
       contextUsageConfiguration: prepared.contextUsageConfiguration,
       contextUsageRevision: prepared.contextUsageRevision,
-      userImagePaths: userImagePaths,
+      userImagePaths:
+          prepared.imageContext?.preparePaths(
+            userImagePaths,
+            allowRemoteImages: prepared.imageContext!.allowsRemoteUserImages,
+          ) ??
+          userImagePaths,
       allowImagesApiRouting: allowImagesApiRouting,
       providerKey: providerKey,
       modelId: modelId,
@@ -917,12 +1165,18 @@ class MessageGenerationService {
         customHeaders: generationController.buildCustomHeaders(assistant),
       ),
       extraBody: generationController.buildCustomBody(assistant),
+      serviceTier: ConversationResponseSpeed.requestTier(
+        chatService.getConversation(assistantMessage.conversationId),
+        settings.getProviderConfig(providerKey),
+        modelId,
+      ),
       supportsReasoning: supportsReasoning,
       enableReasoning: enableReasoning,
       streamOutput: assistant?.streamOutput ?? true,
       ocrActive: ocrActive,
       generateTitleOnFinish: generateTitleOnFinish,
       generationRunId: generationRunId,
+      isContinuation: isContinuation,
       scheduled: scheduled,
       scheduledNotify: scheduledNotify,
       scheduledPreview: scheduledPreview,

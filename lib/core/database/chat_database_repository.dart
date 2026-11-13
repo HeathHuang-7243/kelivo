@@ -1,3 +1,9 @@
+import 'compression_repository.dart';
+import 'extension_entity_store.dart';
+import '../models/compression_config.dart';
+import '../models/image_context.dart';
+import '../utils/chat_image_result.dart';
+import '../utils/conversation_fork_title.dart';
 import '../models/quote_ref.dart';
 import 'package:Kelivo/utils/utf16_safe_cut.dart';
 import 'package:Kelivo/features/search/utils/searchable_text.dart';
@@ -6,6 +12,7 @@ import 'package:Kelivo/features/intelligent_ui/text/ui_search_text.dart';
 import '../../features/intelligent_ui/host/ui_context_submission.dart';
 import '../../features/intelligent_ui/models/ui_context_attachment.dart';
 import 'dart:async';
+import 'dart:collection';
 import '../../features/intelligent_ui/storage/ui_state_repository.dart';
 import '../../features/intelligent_ui/storage/ui_state_transfer.dart';
 import '../../features/intelligent_ui/host/ui_source_map.dart';
@@ -17,6 +24,7 @@ import 'dart:io';
 import 'dart:isolate';
 
 import 'package:crypto/crypto.dart';
+import 'package:collection/collection.dart';
 import 'package:drift/drift.dart';
 import 'package:drift/native.dart';
 import 'package:path/path.dart' as p;
@@ -27,10 +35,14 @@ import 'package:uuid/uuid.dart';
 
 import '../models/chat_message.dart';
 import '../models/context_operation.dart';
+import '../models/context_operation_summary.dart';
+import '../models/compress_context_options.dart';
 import '../models/token_usage.dart';
 import '../models/conversation.dart';
 import '../models/conversation_mcp_settings.dart';
 import '../models/message_part.dart';
+import '../models/message_part_snapshot.dart';
+import '../models/tool_event_snapshot.dart';
 import '../utils/multimodal_input_utils.dart';
 import '../../utils/sandbox_path_resolver.dart';
 import '../../utils/kelivo_file_uri.dart';
@@ -40,12 +52,14 @@ import 'app_database.dart';
 import 'empty_database_recovery_guard.dart';
 import 'empty_database_permission.dart';
 import 'message_timeline_index.dart';
+import 'context_operation_index.dart';
 import 'business_data.dart';
 import 'business_repository.dart';
 import 'chat_database_observer.dart';
 import 'generation_run.dart';
 import 'generation_run_commands.dart';
 import 'schema_migrations.dart';
+import '../services/storage/storage_space.dart';
 import 'gen_ui_derived_schema.dart';
 import '../services/api/stream/stream_chunk_handler.dart';
 import '../services/api/providers/claude/claude_thinking_recovery.dart';
@@ -54,6 +68,8 @@ import '../services/backup/restore_durability.dart';
 import '../services/backup/restore_previous_plan.dart';
 
 part 'chat_context_repository.dart';
+part 'chat_image_context_repository.dart';
+part 'chat_compression_repository.dart';
 
 typedef ChatDatabaseSnapshotInfo = ({
   int schemaVersion,
@@ -179,7 +195,11 @@ class ChatDatabaseRepository {
        _observer = observer ?? ChatDatabaseObserver.instance;
 
   final AppDatabase _db;
+  late final compression = CompressionRepository(ExtensionEntityStore(_db));
   late final _timelineIndex = MessageTimelineIndex(_db);
+  late final _contextIndex = ContextOperationIndex(_db);
+  ({String id, String revision, List<ContextOperation> operations})?
+  _contextOperationCache;
   final Zone _lifetimeZone = Zone.current;
   late final UiStateRepository genUiStates = UiStateRepository(
     _db,
@@ -326,6 +346,9 @@ class ChatDatabaseRepository {
         for (final sql in MessageTimelineIndex.discardStatements) {
           database.execute(sql);
         }
+        for (final sql in ContextOperationIndex.discardStatements) {
+          database.execute(sql);
+        }
         GenUiDerivedSchema.discard(database);
         final presentTables = database
             .select("SELECT name FROM sqlite_master WHERE type = 'table';")
@@ -429,7 +452,8 @@ class ChatDatabaseRepository {
     final int schemaVersion;
     try {
       schemaVersion = SchemaMigrations.readSchemaVersion(file);
-    } on sqlite.SqliteException {
+    } on sqlite.SqliteException catch (error) {
+      if (InsufficientStorageSpace.causedBy(error)) rethrow;
       throw StateError('database_corrupt');
     }
 
@@ -442,7 +466,8 @@ class ChatDatabaseRepository {
         // Deliberately validated only at the current schema; see
         // _validateRawStructure.
         _validateRawStructure(database);
-      } on sqlite.SqliteException {
+      } on sqlite.SqliteException catch (error) {
+        if (InsufficientStorageSpace.causedBy(error)) rethrow;
         throw StateError('database_corrupt');
       } finally {
         database.close();
@@ -458,6 +483,12 @@ class ChatDatabaseRepository {
       throw StateError('database_schema_version');
     }
 
+    // Recheck on every attempt, including installations already copied by an
+    // earlier build. Never start the checkpoint/backup with a known shortfall.
+    await InsufficientStorageSpace.require(
+      64 * 1024 * 1024 + await SchemaMigrations.additionalUpgradeBytes(file),
+    );
+
     final resolvedDurability = durability ?? RestorePlatformDurability();
     final parent = file.absolute.parent;
     final backup = File(
@@ -472,7 +503,8 @@ class ChatDatabaseRepository {
       } finally {
         database.close();
       }
-    } on sqlite.SqliteException {
+    } on sqlite.SqliteException catch (error) {
+      if (InsufficientStorageSpace.causedBy(error)) rethrow;
       throw StateError('database_corrupt');
     }
 
@@ -493,7 +525,7 @@ class ChatDatabaseRepository {
       } finally {
         database.close();
       }
-    } catch (_) {
+    } catch (error, stackTrace) {
       // The copy is deliberately LEFT BEHIND. Between deleting the database
       // family and finishing the copy back there is no usable database on
       // disk, so the copy is the only surviving good state and must outlive
@@ -504,6 +536,9 @@ class ChatDatabaseRepository {
         target: file,
         durability: resolvedDurability,
       );
+      if (InsufficientStorageSpace.causedBy(error)) {
+        Error.throwWithStackTrace(error, stackTrace);
+      }
       throw StateError('database_migration_failed:$schemaVersion');
     }
 
@@ -734,6 +769,9 @@ class ChatDatabaseRepository {
       database.execute('BEGIN IMMEDIATE;');
       try {
         for (final sql in MessageTimelineIndex.discardStatements) {
+          database.execute(sql);
+        }
+        for (final sql in ContextOperationIndex.discardStatements) {
           database.execute(sql);
         }
         database.execute(
@@ -1502,13 +1540,22 @@ class ChatDatabaseRepository {
     }
   }
 
-  Future<void> close() async {
-    await composerDrafts.flush();
-    await genUiStates.pauseAndDrain();
-    composerDrafts.dispose();
-    genUiStates.discardAfterCutover();
-    await _db.close();
-  }
+  Future<void>? _closeFuture;
+
+  Future<void> close() => _closeFuture ??= Future<void>.microtask(() async {
+    composerDrafts.suspended = true;
+    try {
+      await composerDrafts.flush();
+    } finally {
+      try {
+        await genUiStates.pauseAndDrain();
+      } finally {
+        composerDrafts.dispose();
+        genUiStates.discardAfterCutover();
+        await _db.close();
+      }
+    }
+  });
 
   Future<void> ensureReady() async {
     await _db.customSelect('SELECT 1').get();
@@ -1810,7 +1857,8 @@ class ChatDatabaseRepository {
                 SELECT 1 FROM message_part_rows p
                 WHERE p.revision_id = m.id
                   AND (p.kind IN ('image', 'file')
-                    OR (p.kind = 'tool_call' AND p.payload LIKE '%"previewImage"%'))
+                    OR (p.kind = 'tool_call' AND (p.payload LIKE '%"previewImage"%'
+                      OR p.payload LIKE '%"chatImage"%')))
               ) OR
               EXISTS (
                 SELECT 1 FROM message_asset_rows a WHERE a.revision_id = m.id
@@ -2020,6 +2068,9 @@ class ChatDatabaseRepository {
               'truncate': conversation.truncateIndex,
               'summary': conversation.summary,
               'contextOperations': operations.map((op) => op.toJson()).toList(),
+              'imageContext': (await readImageContextSettings(
+                conversationId,
+              )).toJson(),
               'extras': conversation.extras,
               'model': [
                 conversation.chatModelProvider,
@@ -2705,6 +2756,7 @@ class ChatDatabaseRepository {
             .get();
         return getMessagesByIds(
           rows.reversed.map((r) => r.read<String>('revision_id')).toList(),
+          background: true,
         );
       }),
       resultCount: (rows) => rows.length,
@@ -2826,6 +2878,71 @@ class ChatDatabaseRepository {
         ),
     ];
   }
+
+  /// Locates regeneration's source mutations without reading message parts or
+  /// projecting the whole conversation. Only truncation needs the tail groups.
+  Future<({String? targetGroupId, Set<String> removedGroups})>
+  getRegenerationSourceGroups(
+    String conversationId,
+    String revisionId, {
+    required bool assistantAsNewReply,
+    required bool deleteTrailingMessages,
+  }) => _db.transaction(() async {
+    await _timelineIndex.ensureConversation(conversationId);
+    final anchor = await _db
+        .customSelect(
+          'SELECT g.group_id,g.anchor_order FROM timeline_revision_rows r '
+          'JOIN timeline_group_rows g ON g.conversation_id=r.conversation_id AND g.group_id=r.group_id '
+          'WHERE r.conversation_id=? AND r.revision_id=?',
+          variables: [
+            Variable<String>(conversationId),
+            Variable<String>(revisionId),
+          ],
+        )
+        .getSingleOrNull();
+    if (anchor == null) return (targetGroupId: null, removedGroups: <String>{});
+    final rows = await _db
+        .customSelect(
+          'SELECT g.group_id,g.anchor_order,m.id,m.role FROM timeline_group_rows g '
+          'LEFT JOIN timeline_selection_rows s ON s.conversation_id=g.conversation_id AND s.group_id=g.group_id '
+          'JOIN message_rows m ON m.id=${MessageTimelineIndex.selectedRevision('g')} '
+          'WHERE g.conversation_id=? AND (g.anchor_order,g.group_id)>=(?,?) '
+          'ORDER BY g.anchor_order,g.group_id LIMIT 2',
+          variables: [
+            Variable<String>(conversationId),
+            Variable<int>(anchor.read<int>('anchor_order')),
+            Variable<String>(anchor.read<String>('group_id')),
+          ],
+        )
+        .get();
+    if (rows.isEmpty || rows.first.read<String>('id') != revisionId) {
+      return (targetGroupId: null, removedGroups: <String>{});
+    }
+    var keep = rows.first;
+    String? target;
+    if (keep.read<String>('role') == 'assistant') {
+      if (!assistantAsNewReply) target = keep.read<String>('group_id');
+    } else if (rows.length > 1 && rows[1].read<String>('role') == 'assistant') {
+      keep = rows[1];
+      target = keep.read<String>('group_id');
+    }
+    final removed = <String>{};
+    if (deleteTrailingMessages) {
+      final tail = await _db
+          .customSelect(
+            'SELECT group_id FROM timeline_group_rows WHERE conversation_id=? '
+            'AND (anchor_order,group_id)>(?,?) ORDER BY anchor_order,group_id',
+            variables: [
+              Variable<String>(conversationId),
+              Variable<int>(keep.read<int>('anchor_order')),
+              Variable<String>(keep.read<String>('group_id')),
+            ],
+          )
+          .get();
+      removed.addAll(tail.map((row) => row.read<String>('group_id')));
+    }
+    return (targetGroupId: target, removedGroups: removed);
+  });
 
   /// Searches the selected visible revision of each message group.
   ///
@@ -3187,7 +3304,10 @@ class ChatDatabaseRepository {
     });
   }
 
-  Future<List<ChatMessage>> getMessagesByIds(List<String> ids) async {
+  Future<List<ChatMessage>> getMessagesByIds(
+    List<String> ids, {
+    bool background = false,
+  }) async {
     if (ids.isEmpty) return const <ChatMessage>[];
     return _observer.measure(
       ChatDatabaseOperation.queryMessagesByIds,
@@ -3204,7 +3324,10 @@ class ChatDatabaseRepository {
           final rows = await (_db.select(
             _db.messageRows,
           )..where((t) => t.id.isIn(batch))).get();
-          for (final message in await _messagesFromRowsWithParts(rows)) {
+          for (final message in await _messagesFromRowsWithParts(
+            rows,
+            background: background,
+          )) {
             byId[message.id] = message;
           }
         }
@@ -3369,6 +3492,7 @@ class ChatDatabaseRepository {
     String? conversationId,
     String? excludeConversationId,
     String? assistantId,
+    Set<String> excludedConversationIds = const {},
   }) {
     return _observer.measure(
       ChatDatabaseOperation.querySearch,
@@ -3380,6 +3504,7 @@ class ChatDatabaseRepository {
         conversationId: conversationId,
         excludeConversationId: excludeConversationId,
         assistantId: assistantId,
+        excludedConversationIds: excludedConversationIds,
       ),
       resultCount: (rows) => rows.length,
     );
@@ -3393,6 +3518,7 @@ class ChatDatabaseRepository {
     String? conversationId,
     String? excludeConversationId,
     String? assistantId,
+    required Set<String> excludedConversationIds,
   }) async {
     final cleanTokens = tokens
         .map((t) => t.trim().toLowerCase())
@@ -3445,6 +3571,12 @@ class ChatDatabaseRepository {
       if (assistantId != null && assistantId.isNotEmpty) {
         scopeSql += ' AND (c.assistant_id = ? OR c.assistant_id IS NULL)';
         scopeArgs.add(Variable<String>(assistantId));
+      }
+      if (excludedConversationIds.isNotEmpty) {
+        scopeSql += ' AND c.id NOT IN (SELECT value FROM json_each(?))';
+        scopeArgs.add(
+          Variable<String>(jsonEncode(excludedConversationIds.toList())),
+        );
       }
       final candidateLimit = (limit * candidateMultiplier)
           .clamp(limit, 2000)
@@ -4608,6 +4740,26 @@ class ChatDatabaseRepository {
     await _replaceMcpServers(conversationId, serverIds ?? const []);
   });
 
+  // Call inside the transaction that inserts the fork so concurrent copies
+  // cannot claim the same suffix. Read titles only, including other assistants.
+  Future<String> _nextForkTitle(String sourceTitle) async {
+    final title = _db.conversationRows.title;
+    final rows = await (_db.selectOnly(
+      _db.conversationRows,
+    )..addColumns([title])).get();
+    return nextConversationForkTitle(
+      sourceTitle,
+      rows.map((row) => row.read(title)!),
+    );
+  }
+
+  /// Saves a newly constructed message-selection fork with an available title.
+  Future<void> putForkConversation(Conversation conversation) =>
+      _writeTransaction(() async {
+        conversation.title = await _nextForkTitle(conversation.title);
+        await putConversation(conversation);
+      });
+
   Future<Conversation?> duplicateConversation(String sourceId) async {
     await genUiStates.flush();
     return _writeTransaction(() async {
@@ -4642,6 +4794,7 @@ class ChatDatabaseRepository {
       );
       final duplicatedAt = DateTime.now();
       final duplicate = source.copyWith(
+        title: await _nextForkTitle(source.title),
         extras: ToolPermissionMode.withoutGrant(source.extras),
         id: targetId,
         createdAt: duplicatedAt,
@@ -4669,10 +4822,16 @@ class ChatDatabaseRepository {
         messageIdMap: messageIdMap,
         groupIdMap: groupIdMap,
       );
+      await _copyImageContext(sourceId, targetId, messageIdMap);
+      await compression.saveOverrides(
+        targetId,
+        await compression.overrides(sourceId),
+      );
       await _copyContextOperations(
         sourceId: sourceId,
         targetId: targetId,
         groups: groupIdMap,
+        messages: messageIdMap,
         completeHistory: true,
       );
       return duplicate;
@@ -4786,7 +4945,8 @@ class ChatDatabaseRepository {
       'UNION '
       'SELECT revision_id FROM message_part_rows '
       "WHERE conversation_id = ? AND (kind IN ('image', 'file') "
-      "OR (kind = 'tool_call' AND payload LIKE '%\"previewImage\"%'));",
+      "OR (kind = 'tool_call' AND (payload LIKE '%\"previewImage\"%' "
+      "OR payload LIKE '%\"chatImage\"%')));",
       [targetConversationId, targetConversationId],
     );
   }
@@ -4794,7 +4954,6 @@ class ChatDatabaseRepository {
   Future<Conversation?> forkConversationWithVersions({
     required String sourceId,
     required String targetRevisionId,
-    required String title,
     String? assistantId,
     bool preserveVersions = true,
   }) async {
@@ -4846,7 +5005,17 @@ class ChatDatabaseRepository {
       final selected = await _contextMetadata(sourceId);
       final selectedIds = {for (final m in selected) m.id};
       if (!preserveVersions) {
-        kept = kept.where((row) => selectedIds.contains(row.id)).toList();
+        // Revisions are appended in storage, but selected is in group order.
+        // Once the other versions are removed, each copied row must carry its
+        // logical position instead of the revision's original append order.
+        final keptById = {for (final row in kept) row.id: row};
+        kept = [];
+        for (final message in selected) {
+          final row = keptById[message.id];
+          if (row != null) {
+            kept.add(row.copyWith(messageOrder: kept.length));
+          }
+        }
       }
       const uuid = Uuid();
       final targetId = uuid.v4();
@@ -4902,7 +5071,7 @@ class ChatDatabaseRepository {
             _conversationCompanion(
               Conversation(
                 id: targetId,
-                title: title,
+                title: await _nextForkTitle(source.title),
                 createdAt: now,
                 updatedAt: now,
                 assistantId: assistantId,
@@ -4926,10 +5095,16 @@ class ChatDatabaseRepository {
         groupIdMap: groupIdMap,
         resetVersions: !preserveVersions,
       );
+      await _copyImageContext(sourceId, targetId, messageIdMap);
+      await compression.saveOverrides(
+        targetId,
+        await compression.overrides(sourceId),
+      );
       await _copyContextOperations(
         sourceId: sourceId,
         targetId: targetId,
         groups: groupIdMap,
+        messages: messageIdMap,
       );
       if (preserveVersions && !selectedIds.contains(target.id)) {
         await _revokeContextForGroups(targetId, {groupIdMap[targetGroupId]!});
@@ -5341,7 +5516,17 @@ class ChatDatabaseRepository {
   Future<void> _replaceMessageParts(
     ChatMessage message, {
     List<Map<String, dynamic>>? toolEvents,
+    bool streamingCheckpoint = false,
   }) async {
+    // Other writers (edits, imports, recovery) invalidate the streaming base
+    // immediately. A rollback only costs a cache miss, never skipped writes.
+    if (!streamingCheckpoint) {
+      _checkpointParts.remove(message.id);
+      _checkpointRoundPayloads.remove(message.id);
+      _checkpointProjections.remove(message.id);
+    }
+    final baseline = _checkpointParts[message.id];
+    final baselineRounds = _checkpointRoundPayloads[message.id];
     final originalMessage = message;
     // A mid-stream reasoning pause is not a reasoning removal: the checkpoint
     // snapshot still carries the pre-allocated reasoningStartAt timestamp, so
@@ -5373,7 +5558,9 @@ class ChatDatabaseRepository {
     }
     if (_messageHasAttachmentParts(message) ||
         parts.whereType<ToolCallPart>().any(
-          (part) => part.browserPreviewImage != null,
+          (part) =>
+              part.browserPreviewImage != null ||
+              chatImageAssetsFromPart(part).isNotEmpty,
         )) {
       await markMessageAssetReferencesDirty(message.id);
     }
@@ -5383,19 +5570,40 @@ class ChatDatabaseRepository {
               row.ordinal.isBiggerOrEqualValue(parts.length),
         ))
         .go();
-    var ordinal = 0;
     final now = DateTime.now().toUtc();
     final updatedAt = now.isBefore(message.timestamp) ? message.timestamp : now;
+    final roundPayloads = <int, String>{};
+    // Resolve the nullable snapshot outside the loop: AOT can otherwise hoist
+    // the inlined DateTime comparison above its null check (#1342).
+    final baselineParts =
+        baseline != null &&
+            baseline.conversationId == message.conversationId &&
+            baseline.timestamp == message.timestamp
+        ? baseline.parts
+        : const <MessagePart>[];
     await _db.batch((batch) {
-      for (final part in parts) {
+      for (var ordinal = 0; ordinal < parts.length; ordinal++) {
+        final part = parts[ordinal];
+        // Provider replay details can hold a live nested list until Finish.
+        // Compare with the bytes submitted, never a shared mutable list.
+        final roundPayload = part is AssistantRoundEndPart
+            ? part.encodePayload()
+            : null;
+        if (roundPayload != null) roundPayloads[ordinal] = roundPayload;
+        if (ordinal < baselineParts.length &&
+            baselineParts[ordinal] == part &&
+            (roundPayload == null ||
+                baselineRounds?[ordinal] == roundPayload)) {
+          continue;
+        }
         batch.insert(
           _db.messagePartRows,
           MessagePartRowsCompanion.insert(
             conversationId: message.conversationId,
             revisionId: message.id,
-            ordinal: ordinal++,
+            ordinal: ordinal,
             kind: part.kind,
-            payload: part.encodePayload(),
+            payload: roundPayload ?? part.encodePayload(),
             createdAt: message.timestamp,
             updatedAt: updatedAt,
           ),
@@ -5420,6 +5628,23 @@ class ChatDatabaseRepository {
         );
       }
     });
+    if (streamingCheckpoint) {
+      genUiStates.afterCommit(() {
+        _checkpointParts.remove(message.id);
+        _checkpointRoundPayloads.remove(message.id);
+        if (!message.isStreaming) _checkpointProjections.remove(message.id);
+        if (message.isStreaming) {
+          _checkpointParts[message.id] = message.copyWith(parts: parts);
+          _checkpointRoundPayloads[message.id] = roundPayloads;
+          // Bounded acceleration only; an evicted base is written in full.
+          while (_checkpointParts.length > 16) {
+            final oldest = _checkpointParts.keys.first;
+            _checkpointParts.remove(oldest);
+            _checkpointRoundPayloads.remove(oldest);
+          }
+        }
+      });
+    }
     if (!message.isStreaming && UiMessageSource.of(parts).hasCandidate) {
       await _sealGenUiSearch([message.id]);
     }
@@ -5614,13 +5839,15 @@ class ChatDatabaseRepository {
     }
     return _db.transaction(() async {
       await _assertContextState(conversationId, expectedContextState);
-      await readContextOperations(conversationId);
       final row =
           await (_db.select(_db.conversationRows)..where(
                 (conversation) => conversation.id.equals(conversationId),
               ))
               .getSingleOrNull();
       if (row == null) return null;
+      if (expectedContextState == null) {
+        await readContextMutationState(conversationId);
+      }
       final current = await _conversationFromRow(row, includeMessageIds: false);
       final selections = Map<String, int>.from(current.versionSelections);
       if (version == null) {
@@ -5728,6 +5955,10 @@ class ChatDatabaseRepository {
         geminiSignaturesByMessageId: const {},
       );
 
+      for (final conversation in conversations) {
+        await compression.saveOverrides(conversation.id, {'mode': 'off'});
+      }
+
       for (final entry in messagesToAppend.entries) {
         final current = await getConversation(entry.key);
         if (current == null) {
@@ -5795,6 +6026,7 @@ class ChatDatabaseRepository {
           "SELECT kind, id, sort_order, owner_id, payload, updated_at "
           "FROM merge_source.extension_entity_rows WHERE kind IN ('workspace', 'skill', 'composerPublishedFile');",
         );
+        final compressionTemplateIds = await _importCompressionLibrary();
         final sourceRows = await _db
             .customSelect(
               'SELECT id FROM merge_source.conversation_rows ORDER BY id;',
@@ -5892,6 +6124,7 @@ class ChatDatabaseRepository {
             targetId: targetId,
             messageIdMap: messageIdMap,
             importedQuoteExtras: importedQuoteExtras,
+            compressionTemplateIds: compressionTemplateIds,
           );
           imported += 1;
           importedIds.add(targetId);
@@ -6280,6 +6513,11 @@ class ChatDatabaseRepository {
               ),
               mcpRows.map((row) => row.data).toList(),
               messages,
+              await _compressionFingerprint(schema, id),
+              await _imageContextFingerprint(schema, id, {
+                for (var i = 0; i < messageRows.length; i++)
+                  messageRows[i].read<String>('id'): '$i',
+              }),
               await _contextFingerprintData(
                 schema,
                 id,
@@ -6405,6 +6643,7 @@ class ChatDatabaseRepository {
     required String targetId,
     required Map<String, String> messageIdMap,
     required Map<String, String> importedQuoteExtras,
+    required Map<String, String> compressionTemplateIds,
   }) async {
     await _invalidateEmptyAcknowledgement();
     final transfer = UiStateTransfer(_db);
@@ -6529,6 +6768,34 @@ class ChatDatabaseRepository {
       targetConversationId: targetId,
     );
     await _sealGenUiSearch(messageIdMap.values);
+    final importedCompression = await _compressionSettingsFrom(
+      'merge_source',
+      sourceId,
+    );
+    final importedTemplateId = importedCompression['templateId'] as String;
+    await compression.saveOverrides(targetId, {
+      ...importedCompression,
+      'mode': 'off',
+      'templateId':
+          compressionTemplateIds[importedTemplateId] ?? importedTemplateId,
+    });
+    final sourceImages = await _db
+        .customSelect(
+          'SELECT payload FROM merge_source.extension_entity_rows WHERE kind=? AND id=?',
+          variables: [
+            Variable<String>(ImageContextSettings.entityKind),
+            Variable<String>(sourceId),
+          ],
+        )
+        .getSingleOrNull();
+    if (sourceImages != null) {
+      await _copyImageContext(
+        sourceId,
+        targetId,
+        messageIdMap,
+        payload: sourceImages.read<String>('payload'),
+      );
+    }
     final sourceContext = await _db
         .customSelect(
           'SELECT payload FROM merge_source.extension_entity_rows WHERE kind=? AND id=?',
@@ -6543,6 +6810,7 @@ class ChatDatabaseRepository {
         sourceId: sourceId,
         targetId: targetId,
         groups: groupIdMap,
+        messages: messageIdMap,
         sourcePayload: sourceContext.read<String>('payload'),
         completeHistory: true,
       );
@@ -6554,7 +6822,8 @@ class ChatDatabaseRepository {
       'INSERT OR IGNORE INTO asset_reference_dirty_rows(revision_id) '
       'SELECT DISTINCT revision_id FROM main.message_part_rows '
       "WHERE conversation_id = ? AND (kind IN ('image', 'file') "
-      "OR (kind = 'tool_call' AND payload LIKE '%\"previewImage\"%'));",
+      "OR (kind = 'tool_call' AND (payload LIKE '%\"previewImage\"%' "
+      "OR payload LIKE '%\"chatImage\"%')));",
       [targetId],
     );
   }
@@ -6661,6 +6930,7 @@ class ChatDatabaseRepository {
             reasoningTokens: message.reasoningTokens,
             cacheWriteTokens: message.cacheWriteTokens,
             finishUsage: message.finishUsage,
+            firstResponseMs: message.firstResponseMs,
             firstTokenMs: message.firstTokenMs,
             quotes: message.quotes,
           ),
@@ -6836,7 +7106,11 @@ class ChatDatabaseRepository {
       // Keep message_rows (incl. is_streaming) ahead of parts rewrite so the
       // FTS finalize trigger indexes the pre-rewrite text part correctly.
       await _updateMessageRow(message);
-      await _replaceMessageParts(message, toolEvents: toolEvents);
+      await _replaceMessageParts(
+        message,
+        toolEvents: toolEvents,
+        streamingCheckpoint: true,
+      );
       if (generationRunId != null && checkpointSeq != null) {
         await GenerationRunCommands(_db).checkpoint(
           id: generationRunId,
@@ -6847,6 +7121,9 @@ class ChatDatabaseRepository {
       }
     });
   }
+
+  final _checkpointParts = <String, ChatMessage>{};
+  final _checkpointRoundPayloads = <String, Map<int, String>>{};
 
   @Deprecated('legacy/test only; rewrites the complete conversation order')
   Future<void> updateConversationMessages({
@@ -6896,6 +7173,8 @@ class ChatDatabaseRepository {
                   row.kind.isIn([
                     ContextOperation.entityKind,
                     'contextCompressionTask',
+                    CompressionConfig.conversationKind,
+                    ImageContextSettings.entityKind,
                   ]) &
                   row.ownerId.equals(id),
             ))
@@ -7150,7 +7429,7 @@ class ChatDatabaseRepository {
   Future<void> _clearChatRows() async {
     genUiStates.invalidateAfterCommit(all: true);
     await _db.customStatement(
-      "DELETE FROM extension_entity_rows WHERE kind IN ('composerDraft','composerNewEntry','composerPrivateFile','composerPublishedFile','conversationContext','contextCompressionTask')",
+      "DELETE FROM extension_entity_rows WHERE kind IN ('composerDraft','composerNewEntry','composerPrivateFile','composerPublishedFile','conversationContext','contextCompressionTask','conversationImageContext','conversationCompression')",
     );
     await _db.delete(_db.conversationMcpServerRows).go();
     await _db.delete(_db.messageRows).go();
@@ -7790,45 +8069,63 @@ class ChatDatabaseRepository {
     return (await _messagesFromRowsWithParts([row])).single;
   }
 
-  Future<List<ChatMessage>> _messagesFromRowsWithParts(List<MessageRow> rows) =>
-      _db.transaction(() async {
-        if (rows.isEmpty) return const [];
-        final ids = rows.map((row) => row.id).toSet();
-        final parts =
-            await (_db.select(_db.messagePartRows)
-                  ..where((part) => part.revisionId.isIn(ids))
-                  ..orderBy([(part) => OrderingTerm.asc(part.ordinal)]))
-                .get();
-        final byRevision = <String, List<MessagePartRow>>{};
-        for (final part in parts) {
-          byRevision.putIfAbsent(part.revisionId, () => []).add(part);
-        }
-        final runs =
-            await (_db.select(_db.generationRunRows)
-                  ..where((run) => run.targetRevisionId.isIn(ids))
-                  ..orderBy([
-                    (run) => OrderingTerm.desc(run.createdAt),
-                    (run) => OrderingTerm.desc(run.updatedAt),
-                    (run) => OrderingTerm.desc(run.id),
-                  ]))
-                .get();
-        final generationStates = <String, GenerationRunState>{};
-        for (final run in runs) {
-          generationStates.putIfAbsent(
-            run.targetRevisionId,
-            () => GenerationRunState.fromDatabase(run.state),
-          );
-        }
-        return [
-          for (final row in rows)
-            _messageFromRow(row, authoritativeParts: byRevision[row.id])
-              ..hydrateGenerationState(generationStates[row.id]),
-        ];
-      });
+  Future<List<ChatMessage>> _messagesFromRowsWithParts(
+    List<MessageRow> rows, {
+    bool background = false,
+  }) => _db.transaction(() async {
+    if (rows.isEmpty) return const [];
+    final ids = rows.map((row) => row.id).toSet();
+    final parts =
+        await (_db.select(_db.messagePartRows)
+              ..where((part) => part.revisionId.isIn(ids))
+              ..orderBy([(part) => OrderingTerm.asc(part.ordinal)]))
+            .get();
+    final runs =
+        await (_db.select(_db.generationRunRows)
+              ..where((run) => run.targetRevisionId.isIn(ids))
+              ..orderBy([
+                (run) => OrderingTerm.desc(run.createdAt),
+                (run) => OrderingTerm.desc(run.updatedAt),
+                (run) => OrderingTerm.desc(run.id),
+              ]))
+            .get();
+    return background
+        ? _hydrateMessagesInBackground(rows, parts, runs)
+        : _hydrateMessages(rows, parts, runs);
+  });
+
+  static Future<List<ChatMessage>> _hydrateMessagesInBackground(
+    List<MessageRow> rows,
+    List<MessagePartRow> parts,
+    List<GenerationRunRow> runs,
+  ) => Isolate.run(() => _hydrateMessages(rows, parts, runs));
+
+  static List<ChatMessage> _hydrateMessages(
+    List<MessageRow> rows,
+    List<MessagePartRow> parts,
+    List<GenerationRunRow> runs,
+  ) {
+    final byRevision = <String, List<MessagePartRow>>{};
+    for (final part in parts) {
+      byRevision.putIfAbsent(part.revisionId, () => []).add(part);
+    }
+    final generationStates = <String, GenerationRunState>{};
+    for (final run in runs) {
+      generationStates.putIfAbsent(
+        run.targetRevisionId,
+        () => GenerationRunState.fromDatabase(run.state),
+      );
+    }
+    return [
+      for (final row in rows)
+        _messageFromRow(row, authoritativeParts: byRevision[row.id])
+          ..hydrateGenerationState(generationStates[row.id]),
+    ];
+  }
 
   /// Parts come only from [authoritativeParts] in ordinal order. Missing or
   /// empty parts yield empty content via the derived [ChatMessage.content].
-  ChatMessage _messageFromRow(
+  static ChatMessage _messageFromRow(
     MessageRow row, {
     List<MessagePartRow>? authoritativeParts,
   }) {
@@ -7870,6 +8167,7 @@ class ChatDatabaseRepository {
       completionTokens: row.completionTokens,
       cachedTokens: row.cachedTokens,
       durationMs: row.durationMs,
+      firstResponseMs: _tokenExtraInt(extras, _firstResponseMsExtraKey),
       firstTokenMs: _tokenExtraInt(extras, _firstTokenMsExtraKey),
       reasoningTokens: _tokenExtraInt(extras, _reasoningTokensExtraKey),
       cacheWriteTokens: _tokenExtraInt(extras, _cacheWriteTokensExtraKey),
@@ -7886,7 +8184,9 @@ class ChatDatabaseRepository {
       (part) =>
           part is ImagePart ||
           part is FilePart ||
-          (part is ToolCallPart && part.browserPreviewImage != null) ||
+          (part is ToolCallPart &&
+              (part.browserPreviewImage != null ||
+                  chatImageAssetsFromPart(part).isNotEmpty)) ||
           (part is MalformedPart && part.isAttachmentKind),
     );
   }
@@ -7901,6 +8201,33 @@ class ChatDatabaseRepository {
     ChatMessage message,
     List<Map<String, dynamic>>? toolEvents,
   ) {
+    final source = message.parts;
+    final cached = _checkpointProjections[message.id];
+    if (source is MessagePartSnapshot &&
+        (toolEvents == null || toolEvents is ToolEventSnapshot) &&
+        cached != null &&
+        identical(cached.events, toolEvents) &&
+        cached.reasoningText == message.reasoningText &&
+        source.length == cached.source.length) {
+      final changed = source.changesSince(cached.source);
+      if (changed != null &&
+          changed.every(
+            (index) =>
+                source[index] is TextPart && cached.source[index] is TextPart,
+          )) {
+        final result = List<MessagePart>.of(cached.parts);
+        for (final index in changed) {
+          result[index] = source[index];
+        }
+        _checkpointProjections[message.id] = (
+          source: source,
+          events: toolEvents,
+          reasoningText: message.reasoningText,
+          parts: result,
+        );
+        return result;
+      }
+    }
     var parts = List<MessagePart>.of(message.parts);
     if (!parts.any((part) => part is ReasoningPart)) {
       final reasoning = message.reasoningText;
@@ -7921,13 +8248,37 @@ class ChatDatabaseRepository {
     if (parts.isEmpty) {
       return <MessagePart>[TextPart(message.content)];
     }
+    if (source is MessagePartSnapshot && parts.length == source.length) {
+      _checkpointProjections.remove(message.id);
+      _checkpointProjections[message.id] = (
+        source: source,
+        events: toolEvents,
+        reasoningText: message.reasoningText,
+        parts: parts,
+      );
+      while (_checkpointProjections.length > 16) {
+        _checkpointProjections.remove(_checkpointProjections.keys.first);
+      }
+    }
     return parts;
   }
+
+  final _checkpointProjections =
+      <
+        String,
+        ({
+          MessagePartSnapshot source,
+          List<Map<String, dynamic>>? events,
+          String? reasoningText,
+          List<MessagePart> parts,
+        })
+      >{};
 
   List<MessagePart> _applyToolEventsToParts(
     List<MessagePart> parts,
     List<Map<String, dynamic>> toolEvents,
   ) {
+    if (toolEvents.isEmpty) return parts;
     final partCount = parts.whereType<ToolCallPart>().length;
     if (partCount != toolEvents.length) {
       debugPrint(
@@ -7935,14 +8286,18 @@ class ChatDatabaseRepository {
         'parts=$partCount',
       );
     }
-    final unused = [for (final event in toolEvents) event];
+    final byId = <String, Queue<int>>{};
+    final used = List<bool>.filled(toolEvents.length, false);
+    for (var i = 0; i < toolEvents.length; i++) {
+      final id = (toolEvents[i]['id'] ?? '').toString();
+      if (id.isNotEmpty) (byId[id] ??= Queue<int>()).add(i);
+    }
     Map<String, dynamic>? takeById(String id) {
-      if (id.isEmpty) return null;
-      final index = unused.indexWhere(
-        (event) => (event['id'] ?? '').toString() == id,
-      );
-      if (index < 0) return null;
-      return unused.removeAt(index);
+      final queue = byId[id];
+      if (queue == null || queue.isEmpty) return null;
+      final index = queue.removeFirst();
+      used[index] = true;
+      return toolEvents[index];
     }
 
     final matchedByPart = List<Map<String, dynamic>?>.filled(
@@ -7952,16 +8307,23 @@ class ChatDatabaseRepository {
     for (var i = 0; i < parts.length; i++) {
       final part = parts[i];
       if (part is! ToolCallPart) continue;
-      final partId = _toolCallPartId(part) ?? '';
+      final partId = (_decodedToolPayload(part)['id'] ?? '').toString();
       if (partId.isEmpty) continue;
       matchedByPart[i] = takeById(partId);
     }
+    var cursor = 0;
     for (var i = 0; i < parts.length; i++) {
       final part = parts[i];
       if (part is! ToolCallPart) continue;
-      if ((_toolCallPartId(part) ?? '').isNotEmpty) continue;
-      if (unused.isEmpty) break;
-      matchedByPart[i] = unused.removeAt(0);
+      if ((_decodedToolPayload(part)['id'] ?? '').toString().isNotEmpty) {
+        continue;
+      }
+      while (cursor < used.length && used[cursor]) {
+        cursor++;
+      }
+      if (cursor == used.length) break;
+      used[cursor] = true;
+      matchedByPart[i] = toolEvents[cursor++];
     }
 
     final out = <MessagePart>[];
@@ -7974,16 +8336,23 @@ class ChatDatabaseRepository {
       }
       final matched = matchedByPart[i];
       if (matched != null) {
-        out.add(ToolCallPart(jsonEncode(_mergeToolPayload(part, matched))));
+        final base = _decodedToolPayload(part);
+        final merged = _mergeToolPayload(base, matched);
+        out.add(
+          const DeepCollectionEquality().equals(base, merged)
+              ? part
+              : ToolCallPart(jsonEncode(merged)),
+        );
       } else {
         out.add(part);
       }
       lastToolIndex = out.length - 1;
     }
-    if (unused.isNotEmpty) {
-      final extras = [
-        for (final event in unused) ToolCallPart(jsonEncode(event)),
-      ];
+    final extras = [
+      for (var i = 0; i < toolEvents.length; i++)
+        if (!used[i]) ToolCallPart(jsonEncode(toolEvents[i])),
+    ];
+    if (extras.isNotEmpty) {
       final insertAt = lastToolIndex >= 0 ? lastToolIndex + 1 : out.length;
       out.insertAll(insertAt, extras);
     }
@@ -7991,16 +8360,9 @@ class ChatDatabaseRepository {
   }
 
   Map<String, dynamic> _mergeToolPayload(
-    ToolCallPart part,
+    Map<String, dynamic> base,
     Map<String, dynamic> event,
   ) {
-    Map<String, dynamic> base = const <String, dynamic>{};
-    try {
-      final decoded = jsonDecode(part.payloadJson);
-      if (decoded is Map) {
-        base = Map<String, dynamic>.from(decoded);
-      }
-    } catch (_) {}
     final merged = Map<String, dynamic>.from(base);
     for (final entry in event.entries) {
       if (_isEmptyToolOverlay(entry.value) &&
@@ -8058,18 +8420,23 @@ class ChatDatabaseRepository {
     return null;
   }
 
-  String? _toolCallPartId(ToolCallPart part) {
+  final _toolPayloads = Expando<Map<String, dynamic>>(
+    'checkpoint tool payload',
+  );
+
+  Map<String, dynamic> _decodedToolPayload(ToolCallPart part) {
+    final cached = _toolPayloads[part];
+    if (cached != null) return cached;
     try {
       final decoded = jsonDecode(part.payloadJson);
       if (decoded is Map) {
-        final id = (decoded['id'] ?? '').toString();
-        return id.isEmpty ? null : id;
+        return _toolPayloads[part] = Map<String, dynamic>.from(decoded);
       }
     } catch (_) {}
-    return null;
+    return _toolPayloads[part] = const <String, dynamic>{};
   }
 
-  MessagePart _hydratePart({
+  static MessagePart _hydratePart({
     required String revisionId,
     required int ordinal,
     required String kind,
@@ -8130,6 +8497,7 @@ class ChatDatabaseRepository {
           reasoningTokens: message.reasoningTokens,
           cacheWriteTokens: message.cacheWriteTokens,
           finishUsage: message.finishUsage,
+          firstResponseMs: message.firstResponseMs,
           firstTokenMs: message.firstTokenMs,
           quotes: message.quotes,
         ),
@@ -8180,7 +8548,7 @@ class ChatDatabaseRepository {
     }
   }
 
-  Map<String, dynamic> _decodeExtrasJson(String raw) {
+  static Map<String, dynamic> _decodeExtrasJson(String raw) {
     return Conversation.decodeExtras(raw);
   }
 
@@ -8188,8 +8556,9 @@ class ChatDatabaseRepository {
   static const _cacheWriteTokensExtraKey = 'tokens.cacheWrite';
   static const _finishUsageExtraKey = 'tokens.finish';
   static const _firstTokenMsExtraKey = 'timing.firstTokenMs';
+  static const _firstResponseMsExtraKey = 'timing.firstResponseMs';
 
-  int? _tokenExtraInt(Map<String, dynamic> extras, String key) {
+  static int? _tokenExtraInt(Map<String, dynamic> extras, String key) {
     final value = extras[key];
     if (value is int) return value;
     if (value is num) return value.toInt();
@@ -8213,6 +8582,7 @@ class ChatDatabaseRepository {
     int? reasoningTokens,
     int? cacheWriteTokens,
     TokenUsage? finishUsage,
+    int? firstResponseMs,
     int? firstTokenMs,
     List<QuoteRef>? quotes,
   }) {
@@ -8225,6 +8595,9 @@ class ChatDatabaseRepository {
     }
     if (finishUsage != null) {
       extras[_finishUsageExtraKey] = finishUsage.toJson();
+    }
+    if (firstResponseMs != null) {
+      extras[_firstResponseMsExtraKey] = firstResponseMs;
     }
     if (firstTokenMs != null) {
       extras[_firstTokenMsExtraKey] = firstTokenMs;

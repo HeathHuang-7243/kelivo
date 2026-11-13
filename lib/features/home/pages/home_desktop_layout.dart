@@ -23,7 +23,7 @@ import '../../../core/providers/assistant_provider.dart';
 import '../../../core/services/chat/chat_service.dart';
 import '../../../shared/animations/widgets.dart';
 import '../../../shared/widgets/ios_tactile.dart';
-import '../../../utils/brand_assets.dart';
+import '../widgets/model_icon.dart';
 import '../../../utils/sandbox_path_resolver.dart';
 import '../../../desktop/hotkeys/chat_action_bus.dart';
 import '../../../desktop/hotkeys/sidebar_tab_bus.dart';
@@ -44,8 +44,11 @@ class HomeDesktopScaffold extends StatelessWidget {
     required this.title,
     required this.providerName,
     required this.modelDisplay,
+    this.modelProviderKey,
+    this.modelId,
     // Sidebar state
     required this.tabletSidebarOpen,
+    this.compact = false,
     required this.embeddedSidebarWidth,
     required this.sidebarMinWidth,
     required this.sidebarMaxWidth,
@@ -75,9 +78,12 @@ class HomeDesktopScaffold extends StatelessWidget {
   final String title;
   final String? providerName;
   final String? modelDisplay;
+  final String? modelProviderKey;
+  final String? modelId;
 
   // Sidebar state
   final bool tabletSidebarOpen;
+  final bool compact;
   final double embeddedSidebarWidth;
   final double sidebarMinWidth;
   final double sidebarMaxWidth;
@@ -136,14 +142,25 @@ class HomeDesktopScaffold extends StatelessWidget {
           color: cs.surface.withValues(alpha: wallpaper ? .12 : 1),
           child: chat,
         );
-        return SizedBox.expand(
+        final sidebarWidth = compact
+            ? embeddedSidebarWidth.clamp(
+                0.0,
+                MediaQuery.sizeOf(context).width - 48,
+              )
+            : embeddedSidebarWidth;
+        return ClipRect(
           child: Stack(
             fit: StackFit.expand,
             children: [
               Row(
                 children: [
-                  _buildLeftSidebar(context, cs, topicsOnRight),
-                  if (!_isDesktop) SizedBox(width: tabletSidebarOpen ? .6 : 0),
+                  AnimatedContainer(
+                    duration: compact || MediaQuery.disableAnimationsOf(context)
+                        ? Duration.zero
+                        : _sidebarAnimDuration,
+                    curve: _sidebarAnimCurve,
+                    width: !compact && tabletSidebarOpen ? sidebarWidth : 0,
+                  ),
                   Expanded(
                     child: _isDesktop
                         ? DesktopSidePanel(
@@ -160,7 +177,39 @@ class HomeDesktopScaffold extends StatelessWidget {
                   ),
                 ],
               ),
-              if (_isDesktop)
+              if (compact && tabletSidebarOpen)
+                Positioned.fill(
+                  child: ModalBarrier(
+                    color: cs.scrim.withValues(alpha: .16),
+                    onDismiss: onToggleSidebar,
+                  ),
+                ),
+              AnimatedPositioned(
+                key: const ValueKey('desktop-chat-sidebar'),
+                duration: MediaQuery.disableAnimationsOf(context)
+                    ? Duration.zero
+                    : _sidebarAnimDuration,
+                curve: _sidebarAnimCurve,
+                left: tabletSidebarOpen ? 0 : -sidebarWidth,
+                top: 0,
+                bottom: 0,
+                width: sidebarWidth,
+                child: ExcludeFocus(
+                  excluding: !tabletSidebarOpen,
+                  child: IgnorePointer(
+                    ignoring: !tabletSidebarOpen,
+                    child: TickerMode(
+                      enabled: tabletSidebarOpen,
+                      child: _buildLeftSidebar(
+                        context,
+                        topicsOnRight,
+                        sidebarWidth,
+                      ),
+                    ),
+                  ),
+                ),
+              ),
+              if (_isDesktop && !compact)
                 AnimatedPositioned(
                   duration: MediaQuery.disableAnimationsOf(context)
                       ? Duration.zero
@@ -196,12 +245,12 @@ class HomeDesktopScaffold extends StatelessWidget {
 
   Widget _buildLeftSidebar(
     BuildContext context,
-    ColorScheme cs,
     bool topicsOnRight,
+    double width,
   ) {
     final sidebar = SideDrawer(
       embedded: true,
-      embeddedWidth: embeddedSidebarWidth,
+      embeddedWidth: width,
       userName: context.watch<UserProvider>().name,
       assistantName: _getAssistantName(context),
       closePickerTicker: assistantPickerCloseTick,
@@ -223,25 +272,7 @@ class HomeDesktopScaffold extends StatelessWidget {
           onSelectConversation(id),
     );
 
-    return AnimatedContainer(
-      duration: MediaQuery.disableAnimationsOf(context)
-          ? Duration.zero
-          : _sidebarAnimDuration,
-      curve: _sidebarAnimCurve,
-      width: tabletSidebarOpen ? embeddedSidebarWidth : 0,
-      color: Colors.transparent,
-      child: ClipRect(
-        child: OverflowBox(
-          alignment: Alignment.centerLeft,
-          minWidth: 0,
-          maxWidth: embeddedSidebarWidth,
-          child: SizedBox(
-            width: embeddedSidebarWidth,
-            child: _isDesktop ? DesktopPaneSurface(child: sidebar) : sidebar,
-          ),
-        ),
-      ),
-    );
+    return _isDesktop ? DesktopPaneSurface(child: sidebar) : sidebar;
   }
 
   Widget _buildTopics(BuildContext context, double width) => SideDrawer(
@@ -320,12 +351,6 @@ class HomeDesktopScaffold extends StatelessWidget {
     final currentAssistant = context
         .watch<AssistantProvider>()
         .currentAssistant;
-    final String? brandAsset =
-        (modelDisplay != null
-            ? BrandAssets.assetForName(modelDisplay!)
-            : null) ??
-        (providerName != null ? BrandAssets.assetForName(providerName!) : null);
-
     Widget? capsule;
     String? capsuleLabel;
 
@@ -343,30 +368,14 @@ class HomeDesktopScaffold extends StatelessWidget {
           opacity: anim,
           child: ScaleTransition(scale: anim, child: child),
         ),
-        child: (brandAsset != null)
-            ? (brandAsset.endsWith('.svg')
-                  ? SvgPicture.asset(
-                      brandAsset,
-                      width: 16,
-                      height: 16,
-                      key: ValueKey('brand:$brandAsset'),
-                      colorFilter:
-                          isDark && BrandAssets.assetNeedsDarkInvert(brandAsset)
-                          ? ColorFilter.mode(cs.onSurface, BlendMode.srcIn)
-                          : null,
-                    )
-                  : Image.asset(
-                      brandAsset,
-                      width: 16,
-                      height: 16,
-                      key: ValueKey('brand:$brandAsset'),
-                    ))
-            : Icon(
-                Lucide.Boxes,
-                size: 16,
-                color: cs.onSurface.withValues(alpha: 0.7),
-                key: const ValueKey('brand:default'),
-              ),
+        child: CurrentModelIcon(
+          key: ValueKey('$modelProviderKey::$modelId'),
+          providerKey: modelProviderKey,
+          modelId: modelId,
+          size: 16,
+          iconScale: 1,
+          withBackground: false,
+        ),
       );
 
       capsule = IosCardPress(
@@ -405,6 +414,22 @@ class HomeDesktopScaffold extends StatelessWidget {
             ),
           ),
         ),
+      );
+    }
+
+    if (compact) {
+      return Column(
+        crossAxisAlignment: CrossAxisAlignment.start,
+        mainAxisSize: MainAxisSize.min,
+        children: [
+          Text(
+            title,
+            maxLines: 1,
+            overflow: TextOverflow.ellipsis,
+            style: const TextStyle(fontSize: 14),
+          ),
+          if (capsule != null) capsule,
+        ],
       );
     }
 

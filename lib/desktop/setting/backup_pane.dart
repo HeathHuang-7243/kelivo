@@ -1,3 +1,4 @@
+import '../widgets/desktop_labeled_control.dart';
 import 'dart:io';
 
 import 'package:Kelivo/shared/widgets/ios_time_picker.dart';
@@ -933,6 +934,13 @@ class _DesktopBackupPaneState extends State<DesktopBackupPane> {
               ),
             ],
           ),
+          Padding(
+            padding: const EdgeInsets.only(top: 8, bottom: 4),
+            child: Text(
+              l10n.backupPageExportToFileSubtitle,
+              style: TextStyle(fontSize: 12, color: cs.onSurfaceVariant),
+            ),
+          ),
           if (Platform.isIOS)
             Padding(
               padding: const EdgeInsets.only(top: 8, bottom: 4),
@@ -1809,20 +1817,16 @@ class _ItemRow extends StatelessWidget {
     final cs = Theme.of(context).colorScheme;
     return Padding(
       padding: EdgeInsets.symmetric(horizontal: 12, vertical: vpad),
-      child: Row(
-        children: [
-          Expanded(
-            child: Text(
-              label,
-              style: TextStyle(
-                fontSize: 14,
-                color: cs.onSurface.withValues(alpha: 0.88),
-              ),
-            ),
+      child: DesktopLabeledControl(
+        label: Text(
+          label,
+          style: TextStyle(
+            fontSize: 14,
+            color: cs.onSurface.withValues(alpha: 0.88),
           ),
-          const SizedBox(width: 12),
-          Align(alignment: Alignment.centerRight, child: trailing),
-        ],
+        ),
+        control: trailing,
+        controlWidth: 420,
       ),
     );
   }

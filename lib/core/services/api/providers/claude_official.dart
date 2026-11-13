@@ -1,10 +1,12 @@
+import '../../network/provider_http_exception.dart';
+import '../request_history_context.dart';
+import '../request_image_context.dart';
 import '../../../utils/provider_url.dart';
 import '../../custom_request_merger.dart';
 import '../../../models/provider_oauth.dart';
 import '../../auth/claude_oauth_request.dart';
 import 'dart:async';
 import 'dart:convert';
-import 'dart:io';
 
 import 'package:http/http.dart' as http;
 
@@ -31,10 +33,7 @@ import 'claude/claude_history.dart';
 import 'claude/claude_thinking_recovery.dart';
 
 export 'claude/claude_history.dart'
-    show
-        normalizeClaudeImageMime,
-        isClaudeSupportedImageMime,
-        claudeToolResultContent;
+    show isClaudeSupportedImageMime, claudeToolResultContent;
 
 Stream<StreamChunk> sendClaudeStream(
   http.Client client,
@@ -55,6 +54,7 @@ Stream<StreamChunk> sendClaudeStream(
   bool skipImageParsing = false,
   StreamRoundRunner? retryRound,
 }) async* {
+  RequestHistoryContext.current?.format = HistoryWireFormat.claude;
   final upstreamModelId = apiModelId(config, modelId);
   // Endpoint and headers (constant across rounds)
   final base = config.baseUrl.endsWith('/')
@@ -258,6 +258,7 @@ Stream<StreamChunk> sendClaudeStream(
     initialMessages,
   );
   TokenUsage? totalUsage;
+  String? finishReason;
   var streamRound = 0;
   var pendingCalls = <EmitToolCall>[];
   var lastAssistantBlocks = <Map<String, dynamic>>[];
@@ -347,6 +348,7 @@ Stream<StreamChunk> sendClaudeStream(
     retryRound: retryRound,
     sendRound: () async* {
       totalUsage = null;
+      finishReason = null;
       final spec = ModelSpecResolver.instance.spec(config, modelId);
       var retriedContainer = false;
       Map<String, dynamic> buildBody() {
@@ -386,23 +388,26 @@ Stream<StreamChunk> sendClaudeStream(
           assistantBody: extraBody,
         );
         CustomRequestMerger.applyBody(body, extraClaude);
+        if (config.oauthProvider == OAuthProvider.claude) {
+          applyClaudeOAuthOutputLimits(body, maxOutput: spec.maxOutput);
+        }
         applyAnthropicMessagesProtocolConstraints(body);
         if (retriedContainer) body.remove('container');
         thinkingRecovery.filterRequest(body);
         return body;
       }
 
-      http.Request buildRequest(Map<String, dynamic> body) {
+      Future<http.Request> buildRequest(Map<String, dynamic> body) async {
         final request = http.Request('POST', url);
         request.headers.addAll(baseHeaders);
-        request.body = jsonEncode(body);
+        request.body = await RequestImageContext.encodeBody(body);
         return request;
       }
 
       late http.StreamedResponse response;
       while (true) {
         final body = buildBody();
-        response = await client.send(buildRequest(body));
+        response = await client.send(await buildRequest(body));
         if (response.statusCode >= 200 && response.statusCode < 300) break;
         final errorBody = await response.stream.bytesToString();
         if (!recoveredThinking &&
@@ -423,7 +428,7 @@ Stream<StreamChunk> sendClaudeStream(
             body.containsKey('container') &&
             isClaudeStaleContainerError(response.statusCode, errorBody);
         if (!staleContainer) {
-          throw HttpException('HTTP ${response.statusCode}: $errorBody');
+          throw ProviderHttpException(response, errorBody);
         }
         retriedContainer = true;
         container = null;
@@ -439,6 +444,7 @@ Stream<StreamChunk> sendClaudeStream(
       if (!stream) {
         final txt = await decodeUtf8Stream(response.stream);
         final obj = jsonDecode(txt) as Map;
+        finishReason = obj['stop_reason']?.toString();
         // Usage
         try {
           final u = (obj['usage'] as Map?)?.cast<String, dynamic>();
@@ -538,7 +544,9 @@ Stream<StreamChunk> sendClaudeStream(
         if (toolUses.isEmpty) {
           // A hosted tool that ran past the turn limit asks to be resumed,
           // with no client tool to answer first.
-          pauseTurn = (obj['stop_reason'] ?? '').toString() == 'pause_turn';
+          pauseTurn =
+              allTools.isNotEmpty &&
+              (obj['stop_reason'] ?? '').toString() == 'pause_turn';
         }
         if (toolUses.isNotEmpty && onToolCall != null) {
           pendingCalls = [
@@ -646,7 +654,7 @@ Stream<StreamChunk> sendClaudeStream(
 
       final usage = decoder.usage;
       final assistantBlocks = decoder.assistantBlocks;
-      final lastStopReason = decoder.lastStopReason;
+      finishReason = decoder.lastStopReason;
       final toolResultsContent = decoder.toolResults;
 
       totalUsage = usage ?? totalUsage;
@@ -657,7 +665,7 @@ Stream<StreamChunk> sendClaudeStream(
       lastAssistantBlocks = history.sanitize(assistantBlocks);
       yield* recordTurn(assistantBlocks);
       if (decoder.clientTools.isEmpty) {
-        pauseTurn = (lastStopReason ?? '') == 'pause_turn';
+        pauseTurn = allTools.isNotEmpty && (finishReason ?? '') == 'pause_turn';
         return;
       }
 
@@ -687,6 +695,7 @@ Stream<StreamChunk> sendClaudeStream(
             tool.name,
             res?.content ?? '',
             metadata: res?.metadata,
+            toolCallId: tool.id,
             canImageInput: canImageInput,
           )).claudeContent,
         });
@@ -716,6 +725,7 @@ Stream<StreamChunk> sendClaudeStream(
                     item.call.name,
                     item.content,
                     metadata: item.metadata,
+                    toolCallId: item.call.id,
                     canImageInput: canImageInput,
                   )).claudeContent,
                 },
@@ -729,6 +739,7 @@ Stream<StreamChunk> sendClaudeStream(
     finish: () async* {
       yield* emitDone(
         ids: StreamChunkIds('finish'),
+        finishReason: finishReason,
         usage: totalUsage,
         totalTokens: totalUsage?.totalTokens ?? 0,
       );

@@ -9,6 +9,7 @@ import 'package:Kelivo/core/providers/mcp_provider.dart';
 import 'package:Kelivo/core/providers/quick_phrase_provider.dart';
 import 'package:Kelivo/core/providers/settings_provider.dart';
 import 'package:Kelivo/core/providers/world_book_provider.dart';
+import 'package:Kelivo/core/services/chat/chat_service.dart';
 import 'package:Kelivo/desktop/tools_popover.dart';
 import 'package:Kelivo/features/home/services/local_tools_service.dart';
 import 'package:Kelivo/features/home/widgets/chat_input_bar.dart';
@@ -58,10 +59,7 @@ void main() {
       );
       await preferences.setString('current_assistant_id_v1', 'assistant-1');
       provider = AssistantProvider(preferences: preferences);
-      for (var i = 0; i < 100; i++) {
-        if (provider.currentAssistant != null) break;
-        await Future<void>.delayed(const Duration(milliseconds: 10));
-      }
+      await provider.loaded;
     });
     return provider;
   }
@@ -78,6 +76,7 @@ void main() {
     bool desktopTools = false,
     double composerWidth = 800,
     VoidCallback? openBrowser,
+    GlobalKey? reasoningButtonKey,
   }) async {
     final settings = settingsOverride ?? SettingsProvider(preferences);
     final inputBarKey = GlobalKey();
@@ -86,6 +85,7 @@ void main() {
         providers: [
           Provider<BusinessPreferences>.value(value: preferences),
           ChangeNotifierProvider.value(value: settings),
+          ChangeNotifierProvider(create: (_) => ChatService()),
           ChangeNotifierProvider.value(value: assistants),
           ChangeNotifierProvider(create: (_) => AsrProvider()),
           ChangeNotifierProvider(
@@ -113,6 +113,7 @@ void main() {
               builder: (context) {
                 final section = ChatInputSection(
                   inputBarKey: inputBarKey,
+                  reasoningButtonKey: reasoningButtonKey,
                   chatModelProviderKey: providerKey,
                   chatModelId: modelId,
                   chatModelIsConversationOverride: isConversationOverride,
@@ -169,6 +170,30 @@ void main() {
       supportsTools: true,
     ),
   ]) {
+    testWidgets(
+      'reasoning anchor follows the toolbar button and its overflow entry',
+      (tester) async {
+        final assistants = await loadAssistantWithMcp(tester);
+        final key = GlobalKey();
+        for (final width in [800.0, 180.0]) {
+          await pumpComposer(
+            tester,
+            assistants: assistants,
+            isConversationOverride: false,
+            supportsReasoning: true,
+            desktopTools: true,
+            composerWidth: width,
+            reasoningButtonKey: key,
+          );
+          await tester.pumpAndSettle();
+          expect(key.currentContext, isNotNull);
+          final box = key.currentContext!.findRenderObject() as RenderBox;
+          expect(box.size.width, lessThan(80));
+          expect(box.size.height, lessThan(60));
+        }
+      },
+    );
+
     testWidgets('desktop browser entry stays available with ${scenario.name}', (
       tester,
     ) async {

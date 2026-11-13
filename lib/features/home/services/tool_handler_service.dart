@@ -1,3 +1,4 @@
+import '../../../core/services/api/request_image_context.dart';
 import 'package:Kelivo/core/services/conversation_tool_permissions.dart';
 import 'package:Kelivo/core/models/tool_permission_mode.dart';
 import 'package:Kelivo/utils/mcp_structured_image.dart';
@@ -7,7 +8,6 @@ import 'dart:convert';
 import 'package:flutter/widgets.dart';
 import 'package:provider/provider.dart';
 import '../../../core/models/assistant.dart';
-import '../../../core/models/model_spec.dart';
 import '../../../core/models/reasoning_request.dart';
 import '../../../core/providers/assistant_provider.dart';
 import '../../../core/providers/environment_provider.dart';
@@ -29,6 +29,7 @@ import '../../../core/services/search/search_tool_service.dart';
 import '../../../core/services/search/web_fetch_service.dart';
 import '../../../core/services/search/web_fetch_tool_service.dart';
 import '../../../core/services/tools/tool_schema_overrides.dart';
+import '../../../core/services/tools/view_image_tool.dart';
 import '../../../core/services/skills/skills_service.dart';
 import '../../../core/services/workspace/tool_run_registry.dart';
 import '../../../core/services/workspace/workspace_runtime.dart';
@@ -269,6 +270,9 @@ class ToolHandlerService {
   }) {
     final List<Map<String, dynamic>> toolDefs = <Map<String, dynamic>>[];
     final supportsTools = isToolModel(providerKey, modelId);
+    final canImageInput = ModelSpecResolver.instance
+        .spec(settings.getProviderConfig(providerKey), modelId)
+        .supportsImageInput;
 
     // Search tool (skip when Gemini built-in search is active)
     if (assistant?.searchEnabled == true &&
@@ -328,10 +332,6 @@ class ToolHandlerService {
     toolDefs.addAll(mcpTools);
 
     if (supportsTools && workspaceContext != null) {
-      final canImageInput = ModelSpecResolver.instance
-          .spec(settings.getProviderConfig(providerKey), modelId)
-          .input
-          .contains(Modality.image);
       toolDefs.addAll(
         _workspaceTools()
             .buildToolDefinitions(workspaceContext)
@@ -341,6 +341,19 @@ class ToolHandlerService {
                   (definition['function'] as Map)['name'] != 'view_image',
             ),
       );
+    }
+
+    // Keep one candidate for images returned later in the tool loop. Each
+    // outgoing request gates conversation lookup independently of file access.
+    if (supportsTools && canImageInput && conversationId != null) {
+      final index = toolDefs.indexWhere(
+        (tool) => (tool['function'] as Map?)?['name'] == ViewImageTool.name,
+      );
+      if (index < 0) {
+        toolDefs.add(ViewImageTool.withHistory());
+      } else {
+        toolDefs[index] = ViewImageTool.withHistory(toolDefs[index]);
+      }
     }
 
     final overrides = settings.toolSchemaOverrides;
@@ -532,6 +545,49 @@ class ToolHandlerService {
       final permission = permissionFor(name, toolCallId);
       Future<Object?> execute() async {
         try {
+          if (name == ViewImageTool.name &&
+              (args['image_id'] != null || args['path'] == null)) {
+            if (args['path'] != null && args['image_id'] != null) {
+              return _toolError(
+                error: 'invalid_arguments',
+                message: 'Supply either image_id or path, never both.',
+                tool: name,
+              );
+            }
+            final imageContext = RequestImageContext.current;
+            final chat = permissionChat;
+            if (imageContext == null ||
+                conversationId == null ||
+                chat == null) {
+              return const ClientToolResult(
+                'Image is unavailable in the current conversation context.',
+              );
+            }
+            if (!(await chat.imageContextSettings(
+              conversationId,
+            )).allowRecall) {
+              return const ClientToolResult(
+                'Image recall is disabled for this conversation. Ask the user to attach the image again if needed.',
+              );
+            }
+            final allowed = await chat.imageContextHistory(
+              conversationId,
+              throughMessageId: imageContext.targetMessageId,
+            );
+            return imageContext.readImage(
+              (args['image_id'] ?? '').toString(),
+              allowedMessages: allowed.map((m) => m.id).toSet(),
+              offset: args['offset'] is int ? args['offset'] as int : 0,
+            );
+          }
+          if (name == ViewImageTool.name && workspaceContext == null) {
+            return _toolError(
+              error: 'tool_disabled',
+              message:
+                  'File viewing requires an enabled workspace image viewer.',
+              tool: name,
+            );
+          }
           if (name == BrowserToolsService.toolName) {
             final current = assistant == null
                 ? null

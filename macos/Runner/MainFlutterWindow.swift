@@ -1,3 +1,4 @@
+import ServiceManagement
 import Cocoa
 import FlutterMacOS
 import WebKit
@@ -23,6 +24,7 @@ class MainFlutterWindow: NSWindow {
   private var sidebarCursorFocusObserver: Any?
   private var sidebarCursorPoint: NSPoint?
   private let browserInsetLeases = BrowserViewportInsetLeases()
+  private let trafficLightSize: CGFloat = 12
   private var trafficLightConstraints: [(top: NSLayoutConstraint, left: NSLayoutConstraint)] = []
 
   deinit {
@@ -40,7 +42,7 @@ class MainFlutterWindow: NSWindow {
   private let autosaveName = NSWindow.FrameAutosaveName("KelivoMainWindowFrame")
 
   // Minimum reasonable content size to ensure the window is visible and usable.
-  private let minContentSize = NSSize(width: 960, height: 640)
+  private let minContentSize = NSSize(width: 360, height: 640)
 
   // Clamp a size within min bounds and the given screen's visible frame
   private func clampedSize(_ size: NSSize, for screen: NSScreen?) -> NSSize {
@@ -91,6 +93,9 @@ class MainFlutterWindow: NSWindow {
   // Layout helper: re-position the traffic light buttons
   private func layoutTrafficLightButton(titlebarView: NSView, button: NSButton, offsetTop: CGFloat, offsetLeft: CGFloat) {
     button.translatesAutoresizingMaskIntoConstraints = false
+    // Scale the native artwork along with its frame instead of clipping it.
+    button.setFrameSize(NSSize(width: trafficLightSize, height: trafficLightSize))
+    button.setBoundsSize(button.intrinsicContentSize)
     let top = NSLayoutConstraint(
       item: button,
       attribute: .top,
@@ -109,7 +114,11 @@ class MainFlutterWindow: NSWindow {
       multiplier: 1,
       constant: offsetLeft
     )
-    NSLayoutConstraint.activate([top, left])
+    NSLayoutConstraint.activate([
+      top, left,
+      button.widthAnchor.constraint(equalToConstant: trafficLightSize),
+      button.heightAnchor.constraint(equalToConstant: trafficLightSize),
+    ])
     trafficLightConstraints.append((top: top, left: left))
   }
 
@@ -283,10 +292,10 @@ class MainFlutterWindow: NSWindow {
   }
 
   private func setBrowserChrome(_ enabled: Bool) {
-    // Center the 14-point system buttons within the browser's 44-point tab row.
+    // Center the compact system buttons within the browser's 44-point tab row.
     // Restore the existing app layout when its route closes.
     for (index, constraints) in trafficLightConstraints.enumerated() {
-      constraints.top.constant = enabled ? 15 : 14
+      constraints.top.constant = enabled ? (44 - trafficLightSize) / 2 : 14
       constraints.left.constant = enabled ? 20 + CGFloat(index) * 24 : 12 + CGFloat(index) * 18
     }
     standardWindowButton(.closeButton)?.superview?.layoutSubtreeIfNeeded()
@@ -400,6 +409,50 @@ class MainFlutterWindow: NSWindow {
     // Place system traffic light buttons
     self.layoutTrafficLights()
 
+    FlutterMethodChannel(
+      name: "app.desktop_startup", binaryMessenger: flutterViewController.engine.binaryMessenger
+    ).setMethodCallHandler { call, result in
+      if call.method == "wasLaunchedAtLogin" {
+        guard let delegate = NSApp.delegate as? AppDelegate else {
+          result(false)
+          return
+        }
+        delegate.readLoginLaunch { result($0) }
+        return
+      }
+      guard #available(macOS 13.0, *) else {
+        if call.method == "getState" {
+          result(["supported": false, "enabled": false])
+        } else {
+          result(FlutterError(code: "startup_unsupported", message: "Requires macOS 13", details: nil))
+        }
+        return
+      }
+      switch call.method {
+      case "getState":
+        result(["supported": true, "enabled": SMAppService.mainApp.status == .enabled])
+      case "setEnabled":
+        guard let enabled = call.arguments as? Bool else {
+          result(FlutterError(code: "invalid_arguments", message: "Expected a boolean", details: nil))
+          return
+        }
+        do {
+          if enabled {
+            try SMAppService.mainApp.register()
+          } else {
+            try SMAppService.mainApp.unregister()
+          }
+          if enabled && SMAppService.mainApp.status == .requiresApproval {
+            SMAppService.openSystemSettingsLoginItems()
+          }
+          result(nil)
+        } catch {
+          result(FlutterError(code: "startup_write_failed", message: error.localizedDescription, details: nil))
+        }
+      default:
+        result(FlutterMethodNotImplemented)
+      }
+    }
     RegisterGeneratedPlugins(registry: flutterViewController)
     let glassRegistrar = flutterViewController.registrar(forPlugin: "BrowserGlass")
     glassRegistrar.register(

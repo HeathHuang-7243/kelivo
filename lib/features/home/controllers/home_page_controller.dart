@@ -1,3 +1,7 @@
+import '../../../core/models/context_compression_task.dart'
+    show CompressionRequestPreview;
+import '../../chat/widgets/context_compression_status.dart';
+import '../../../core/models/compression_config.dart';
 import '../../chat/controllers/quote_editing_controller.dart';
 import '../../side_panel/desktop_side_panel_controller.dart';
 import 'package:Kelivo/features/intelligent_ui/host/ui_search_navigation.dart';
@@ -186,6 +190,8 @@ class HomePageController extends ChangeNotifier {
   /// Serial of the latest animated conversation transition; superseded
   /// transitions check it to discard their pre-commit work.
   int _switchSerial = 0;
+  int _messageJumpSerial = 0;
+  bool _messageJumpInProgress = false;
 
   // Startup warm-up (cache plan measure 14): after the initial restore
   // completes, an idle-time serial prefetch of the most recent conversations.
@@ -247,6 +253,8 @@ class HomePageController extends ChangeNotifier {
 
   // Sidebar state (tablet/desktop)
   bool _tabletSidebarOpen = true;
+  bool _compactDesktop = false;
+  bool _compactSidebarOpen = false;
   double _embeddedSidebarWidth = 300;
   bool _desktopUiInited = false;
 
@@ -667,7 +675,8 @@ class HomePageController extends ChangeNotifier {
   Set<String> get selectedItems => _selectedItems;
   int get selectedCount => _selectedItems.length;
   bool get isDragHovering => _isDragHovering;
-  bool get tabletSidebarOpen => _tabletSidebarOpen;
+  bool get tabletSidebarOpen =>
+      _compactDesktop ? _compactSidebarOpen : _tabletSidebarOpen;
   double get embeddedSidebarWidth => _embeddedSidebarWidth;
   double get inputBarHeight => _inputBarHeight;
   bool get desktopUiInited => _desktopUiInited;
@@ -922,12 +931,40 @@ class HomePageController extends ChangeNotifier {
   }
 
   void _wireViewModelCallbacks() {
-    _viewModel.onError = (error) {
+    _viewModel.onContextOverflow = (message, error, originalParts) {
+      if (!_context.mounted) return;
       final l10n = AppLocalizations.of(_context)!;
       showAppSnackBar(
         _context,
         message: _localizeGenerationError(l10n, error),
-        type: NotificationType.error,
+        type: NotificationType.warning,
+        actionLabel: l10n.compressionOverflowAction,
+        onAction: () => _viewModel.compressAndRetryContext(
+          message,
+          originalParts: originalParts,
+        ),
+      );
+    };
+    _viewModel.onError = (error) {
+      final l10n = AppLocalizations.of(_context)!;
+      final compressionFailure =
+          error != 'compression_near_limit' &&
+          (error.contains('compression_') ||
+              error.contains('native_compaction_'));
+      showAppSnackBar(
+        _context,
+        message: error == 'compression_near_limit'
+            ? l10n.compressionNearLimit
+            : _localizeGenerationError(l10n, error),
+        type: error == 'compression_near_limit'
+            ? NotificationType.info
+            : NotificationType.error,
+        actionLabel: compressionFailure
+            ? l10n.ttsServicesDialogErrorTitle
+            : null,
+        onAction: compressionFailure
+            ? () => showCompressionErrorDetails(_context, error)
+            : null,
       );
     };
     _viewModel.onWarning = (warning) {
@@ -961,6 +998,8 @@ class HomePageController extends ChangeNotifier {
           );
         };
     _viewModel.onConversationSwitched = () {
+      // Committing the new window already invalidated its predecessor's read.
+      _resetMessageJump();
       _restoreMessageUiState();
       _scrollCtrl.positionAtBottomOnNextLayout();
     };
@@ -975,6 +1014,10 @@ class HomePageController extends ChangeNotifier {
   }
 
   String _localizeGenerationError(AppLocalizations l10n, String error) {
+    if (error.contains('compression_') ||
+        error.contains('native_compaction_')) {
+      return compressionErrorLabel(l10n, error);
+    }
     if (error.contains('context_changed')) return l10n.contextChanged;
     if (error.contains('context_budget_exceeded')) {
       return l10n.contextBudgetExceeded;
@@ -1065,13 +1108,7 @@ class HomePageController extends ChangeNotifier {
           }
           final wantAssistants =
               (action == ChatAction.toggleLeftPanelAssistants);
-          if (!_tabletSidebarOpen) {
-            _tabletSidebarOpen = true;
-            notifyListeners();
-            try {
-              settingsProvider.setDesktopSidebarOpen(true);
-            } catch (_) {}
-          }
+          if (!tabletSidebarOpen) toggleTabletSidebar();
           if (wantAssistants) {
             DesktopSidebarTabBus.instance.switchToAssistants();
           } else {
@@ -1275,6 +1312,7 @@ class HomePageController extends ChangeNotifier {
 
   void enterGlobalSearchMode({bool preserveQuery = true}) {
     _isGlobalSearchMode = true;
+    if (_compactDesktop) _compactSidebarOpen = true;
     if (!preserveQuery) _globalSearchQuery = '';
     notifyListeners();
   }
@@ -1699,38 +1737,32 @@ class HomePageController extends ChangeNotifier {
     ChatMessage message, {
     bool assistantAsNewReply = false,
     bool? allowImagesApiRouting,
+    bool omitImages = false,
   }) async {
     if (currentConversation == null) return;
-    final projected = await _chatService.loadSelectedMessageProjections(
-      message.conversationId,
-    );
-    if (!_context.mounted) return;
     final deletingTail = _context
         .read<SettingsProvider>()
         .regenerateDeleteTrailingMessages;
-    final versioning = _messageGenerationService
-        .calculateRegenerationVersioning(
-          message: message,
-          messages: projected,
-          assistantAsNewReply: assistantAsNewReply,
-        );
+    final source = await _chatService.loadRegenerationSourceGroups(
+      message.conversationId,
+      message.id,
+      assistantAsNewReply: assistantAsNewReply,
+      deleteTrailingMessages: deletingTail,
+    );
+    if (!_context.mounted ||
+        currentConversation?.id != message.conversationId) {
+      return;
+    }
     final affectedGroups = {
-      if (versioning.targetGroupId != null) versioning.targetGroupId!,
+      if (source.targetGroupId != null) source.targetGroupId!,
+      ...source.removedGroups,
     };
-    final removedGroups = deletingTail && versioning.lastKeep >= 0
-        ? projected
-              .skip(versioning.lastKeep + 1)
-              .map(ContextHistory.group)
-              .where((group) => group != versioning.targetGroupId)
-              .toSet()
-        : <String>{};
-    affectedGroups.addAll(removedGroups);
     final approved = await confirmContextSourceMutation(
       _context,
       chat: _chatService,
       conversationId: message.conversationId,
       groups: affectedGroups,
-      removedGroups: removedGroups,
+      removedGroups: source.removedGroups,
     );
     if (approved == null) return;
     _warmupSerial++;
@@ -1755,6 +1787,7 @@ class HomePageController extends ChangeNotifier {
 
     final success = await _viewModel.regenerateAtMessage(
       message,
+      omitImages: omitImages,
       assistantAsNewReply: assistantAsNewReply,
       expectedContextState: approved,
       allowImagesApiRouting:
@@ -1828,6 +1861,7 @@ class HomePageController extends ChangeNotifier {
 
   Future<void> switchConversationAnimated(String id) async {
     final serial = ++_switchSerial;
+    _cancelMessageJump();
     _warmupSerial++;
     if (currentConversation?.id == id) {
       // Already on the target: the serial bump above cancels any in-flight
@@ -1880,7 +1914,7 @@ class HomePageController extends ChangeNotifier {
             !identical(_scrollCtrl, activeScrollController)) {
           return;
         }
-        await _convoFadeController.forward();
+        await _convoFadeController.forward().orCancel;
       } catch (_) {}
     } else {
       // Desktop uses the same prepare/commit atomicity as mobile, without
@@ -1909,13 +1943,13 @@ class HomePageController extends ChangeNotifier {
 
   Future<void> _reverseConvoFade() async {
     try {
-      await _convoFadeController.reverse();
+      await _convoFadeController.reverse().orCancel;
     } catch (_) {}
   }
 
   Future<void> _forwardConvoFade() async {
     try {
-      await _convoFadeController.forward();
+      await _convoFadeController.forward().orCancel;
     } catch (_) {}
   }
 
@@ -1930,6 +1964,7 @@ class HomePageController extends ChangeNotifier {
   }) async {
     // Cancel any in-flight conversation switch fetch.
     final serial = ++_switchSerial;
+    _cancelMessageJump();
     final assistantId = _context.read<AssistantProvider>().currentAssistantId;
     _warmupSerial++;
     _selectionEpoch++;
@@ -2027,12 +2062,28 @@ class HomePageController extends ChangeNotifier {
     notifyListeners();
   }
 
+  Future<CompressionRequestPreview> previewCompressionRequest(
+    String id,
+    CompressContextOptions options,
+    CompressionConfig config, {
+    required Future<ConversationContextHistory> history,
+  }) => _viewModel.previewCompressionRequest(
+    id,
+    options,
+    config,
+    history: history,
+  );
+
   Future<String?> compressContext({
     required CompressContextOptions options,
     String? targetConversationId,
+    String? beforeMessageId,
+    Set<String>? effectiveMessageIds,
   }) => _viewModel.compressContext(
     options: options,
     targetConversationId: targetConversationId,
+    beforeMessageId: beforeMessageId,
+    effectiveMessageIds: effectiveMessageIds,
   );
 
   // ============================================================================
@@ -3172,7 +3223,26 @@ class HomePageController extends ChangeNotifier {
   // Public Methods - Sidebar Management
   // ============================================================================
 
+  // Called by the page while building; changing width does not overwrite the
+  // user's wide-window sidebar preference or notify during a build.
+  void setCompactDesktopLayout(bool compact) {
+    if (_compactDesktop == compact) return;
+    _compactDesktop = compact;
+    _compactSidebarOpen = compact && _isGlobalSearchMode;
+  }
+
+  void closeCompactSidebar() {
+    if (!_compactDesktop || !_compactSidebarOpen) return;
+    _compactSidebarOpen = false;
+    notifyListeners();
+  }
+
   void toggleTabletSidebar() {
+    if (_compactDesktop) {
+      _compactSidebarOpen = !_compactSidebarOpen;
+      notifyListeners();
+      return;
+    }
     dismissKeyboard();
     try {
       if (_context.read<SettingsProvider>().hapticsOnDrawer) {
@@ -3686,9 +3756,33 @@ class HomePageController extends ChangeNotifier {
   Future<List<MiniMapSearchHit>> searchMiniMapMatches(String query) =>
       _chatController.searchMiniMapMatches(query);
 
-  // Issue 7 audit: jumps via collapsed-index + loadUntilMessageVisible only.
-  // Does not call ChatService.getMessageIndex, so an absent message-order
-  // skeleton during loadTimelinePage backfill does not require a guard here.
+  void _cancelMessageJump() {
+    if (_messageJumpInProgress) _chatController.cancelPendingWindowLoad();
+    _resetMessageJump();
+  }
+
+  int _beginMessageJump() {
+    if (_messageJumpInProgress) _chatController.cancelPendingWindowLoad();
+    _messageJumpInProgress = true;
+    return ++_messageJumpSerial;
+  }
+
+  void _resetMessageJump() {
+    _messageJumpSerial++;
+    _messageJumpInProgress = false;
+    // This opacity wraps every conversation. An old page read must not keep
+    // a newly selected conversation invisible until that read completes.
+    _messageJumpTransitionController.value = 1.0;
+  }
+
+  bool _ownsMessageJump(int serial) =>
+      !_composerDisposed && serial == _messageJumpSerial;
+
+  bool _isMessageJumpCurrent(int serial, String? conversationId) =>
+      _ownsMessageJump(serial) && currentConversation?.id == conversationId;
+
+  // Jumps use the collapsed index and bounded window reads, without relying
+  // on a cached full message-order skeleton.
   Future<void> scrollToMessageId(
     String targetId, {
     bool useRikkaTransition = false,
@@ -3696,21 +3790,24 @@ class HomePageController extends ChangeNotifier {
   }) async {
     _warmupSerial++;
     uiSearchNavigation.clear();
+    final serial = _beginMessageJump();
     final conversationId = currentConversation?.id;
-    if (useRikkaTransition) {
-      try {
-        await _messageJumpTransitionController.reverse();
-      } catch (_) {}
-    }
 
     try {
+      if (useRikkaTransition) {
+        await _messageJumpTransitionController.reverse().orCancel;
+      } else {
+        _messageJumpTransitionController.value = 1.0;
+      }
+      if (!_isMessageJumpCurrent(serial, conversationId)) return;
       if (_chatController.indexOfCollapsedMessageId(targetId) < 0) {
         final loaded = await _viewModel.loadUntilMessageVisible(targetId);
-        if (!loaded) return;
+        if (!loaded || !_isMessageJumpCurrent(serial, conversationId)) return;
         try {
           await WidgetsBinding.instance.endOfFrame;
         } catch (_) {}
       }
+      if (!_isMessageJumpCurrent(serial, conversationId)) return;
       final index = _chatController.indexOfCollapsedMessageId(targetId);
       if (index < 0) return;
       await _scrollCtrl.scrollToMessageId(
@@ -3719,20 +3816,28 @@ class HomePageController extends ChangeNotifier {
       );
       if (surfaceKey != null &&
           conversationId != null &&
-          currentConversation?.id == conversationId) {
+          _isMessageJumpCurrent(serial, conversationId)) {
         uiSearchNavigation.reveal(conversationId, targetId, surfaceKey);
       }
+    } on TickerCanceled {
+      // A newer navigation owns the animation and its visibility.
     } finally {
-      if (useRikkaTransition) {
+      if (useRikkaTransition && _ownsMessageJump(serial)) {
         try {
-          await _messageJumpTransitionController.forward();
-        } catch (_) {}
+          await _messageJumpTransitionController.forward().orCancel;
+        } on TickerCanceled {
+          // Superseded while revealing the list.
+        }
       }
+      if (serial == _messageJumpSerial) _messageJumpInProgress = false;
     }
   }
 
   Future<void> jumpToPreviousQuestion() =>
       _jumpToAdjacentMessage(previous: true);
+
+  void scrollToSourceRect(Rect rect) =>
+      _scrollCtrl.scrollToSourceRect(rect, bottomInset: inputBarHeight);
 
   Future<void> jumpToNextQuestion() => _jumpToAdjacentMessage(previous: false);
 
@@ -3806,16 +3911,20 @@ class HomePageController extends ChangeNotifier {
   }
 
   Future<void> forceScrollToBottom({bool animate = true}) async {
+    final serial = _beginMessageJump();
+    final conversationId = currentConversation?.id;
     final useJumpTransition = animate && _chatController.hasMoreAfter;
-    if (useJumpTransition) {
-      try {
-        await _messageJumpTransitionController.reverse();
-      } catch (_) {}
-    }
 
     try {
+      if (useJumpTransition) {
+        await _messageJumpTransitionController.reverse().orCancel;
+      } else {
+        _messageJumpTransitionController.value = 1.0;
+      }
+      if (!_isMessageJumpCurrent(serial, conversationId)) return;
       if (_chatController.hasMoreAfter) {
         final loaded = await _chatController.loadEndWindow();
+        if (!_isMessageJumpCurrent(serial, conversationId)) return;
         if (loaded) {
           _viewModel.restoreMessageUiState();
         }
@@ -3824,16 +3933,22 @@ class HomePageController extends ChangeNotifier {
         try {
           await WidgetsBinding.instance.endOfFrame;
         } catch (_) {}
+        if (!_isMessageJumpCurrent(serial, conversationId)) return;
         await _scrollCtrl.settleAtBottomBeforeReveal();
       } else {
         _scrollCtrl.forceScrollToBottom(animate: animate);
       }
+    } on TickerCanceled {
+      // A newer navigation owns the animation and its visibility.
     } finally {
-      if (useJumpTransition) {
+      if (useJumpTransition && _ownsMessageJump(serial)) {
         try {
-          await _messageJumpTransitionController.forward();
-        } catch (_) {}
+          await _messageJumpTransitionController.forward().orCancel;
+        } on TickerCanceled {
+          // Superseded while revealing the list.
+        }
       }
+      if (serial == _messageJumpSerial) _messageJumpInProgress = false;
     }
   }
 
@@ -3858,16 +3973,6 @@ class HomePageController extends ChangeNotifier {
   // ============================================================================
 
   String titleForLocale() => _titleForLocale(_context);
-
-  /// Trailing label for the context management sheet, e.g. "12 messages".
-  String contextMessageCountLabel() {
-    final l10n = AppLocalizations.of(_context)!;
-    final count = _viewModel.getContextMessageCount();
-    final configured = count.configured;
-    return configured == null
-        ? l10n.contextMessageCount(count.actual)
-        : l10n.contextMessageCountLimited(count.actual, configured);
-  }
 
   String? currentStreamingMessageId() {
     for (int i = messages.length - 1; i >= 0; i--) {

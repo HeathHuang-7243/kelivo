@@ -4,7 +4,9 @@ import 'package:flutter/material.dart';
 import 'package:provider/provider.dart';
 
 import '../../core/providers/settings_provider.dart';
+import 'android_text_selection_toolbar.dart';
 import 'ios_text_selection_toolbar.dart';
+import 'package:Kelivo/theme/app_font_weights.dart';
 
 /// Platform selection menus whose desktop labels use the application font.
 class AppTextSelectionToolbar extends StatelessWidget {
@@ -14,6 +16,7 @@ class AppTextSelectionToolbar extends StatelessWidget {
     required this.buttonItems,
     required this.selectionContext,
     required this.onDismiss,
+    this.keepOpenOnSelectAll = true,
     this.separatorsBefore = const {},
     this.shortcuts = const {},
   });
@@ -22,6 +25,9 @@ class AppTextSelectionToolbar extends StatelessWidget {
   final List<ContextMenuButtonItem> buttonItems;
   final BuildContext selectionContext;
   final VoidCallback onDismiss;
+
+  /// Whether Android retains the current menu and callbacks for Select All.
+  final bool keepOpenOnSelectAll;
   final Set<ContextMenuButtonItem> separatorsBefore;
   final Map<ContextMenuButtonItem, String> shortcuts;
 
@@ -39,6 +45,15 @@ class AppTextSelectionToolbar extends StatelessWidget {
         buttonItems: buttonItems,
         selectionContext: selectionContext,
         onDismiss: onDismiss,
+      );
+    }
+    if (!kIsWeb && defaultTargetPlatform == TargetPlatform.android) {
+      return AndroidTextSelectionToolbar(
+        anchors: anchors,
+        buttonItems: buttonItems,
+        selectionContext: selectionContext,
+        onDismiss: onDismiss,
+        keepOpenOnSelectAll: keepOpenOnSelectAll,
       );
     }
     if (platform != TargetPlatform.macOS &&
@@ -59,7 +74,7 @@ class AppTextSelectionToolbar extends StatelessWidget {
       fontFamilyFallback: appStyle?.fontFamilyFallback,
       fontSize: 14,
       letterSpacing: -0.15,
-      fontWeight: FontWeight.w400,
+      fontWeight: AppFontWeights.regular,
     );
     return AdaptiveTextSelectionToolbar(
       anchors: anchors,
